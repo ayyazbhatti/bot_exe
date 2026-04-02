@@ -1,0 +1,16 @@
+{
+  "api_base": "http://127.0.0.1:3001",
+  "device_id": "",
+  "token": "",
+  "poll_interval_sec": 2,
+  "poll_burst_delay_sec": 0.05,
+  "positions_snapshot_interval_sec": 10,
+  "heartbeat_interval_sec": 15,
+  "agent_version": "0.2.0",
+  "bridge_script": "python_bridge/mt5_bridge.py",
+  "python_exe": "runtime/python/python.exe",
+  "accounts": {
+    "default": "C:\\Program Files\\MetaTrader 5\\terminal64.exe",
+    "exness": "C:\\Program Files\\MetaTrader 5 EXNESS\\terminal64.exe"
+  }
+}

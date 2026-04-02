@@ -1,0 +1,46 @@
+# Rust
+backend/target/
+backend/data/
+backend/logs/
+
+# Project root logs
+logs/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Desktop agent (local secrets)
+desktop_agent/config.json
+desktop_agent/panel_api_url.txt
+desktop_agent/dist/
+desktop_agent/build/
+desktop_agent/*.spec
+desktop_agent/.python_embed_cache/
+desktop_agent/installer_output/
+desktop_agent/dist_staging/
+desktop_agent/build_staging/
+
+# Python
+python_bridge/__pycache__/
+python_bridge/logs/
+*.pyc
+.venv/
+venv/
+
+# Env
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Windows helper binaries (downloaded on demand)
+windows/tools/
+
+# OS
+.DS_Store
+Thumbs.db

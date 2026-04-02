@@ -1,0 +1,31 @@
+MT5 Remote Agent — quick start
+
+Single installer (easiest): on the build PC run desktop_agent\build_installer.ps1 (needs Inno Setup 6).
+Copy only installer_output\MT5RemoteAgent-Setup-*.exe (version in filename) to the trading PC and run it as admin.
+It installs the full app under Program Files (exe, _internal, python_bridge, runtime, config templates).
+The running agent writes settings to %LOCALAPPDATA%\MT5RemoteAgent\config.json (users can edit that file;
+Program Files is read-only for normal accounts).
+
+Why a folder when not using the installer? The program needs: the .exe, library bundle (_internal),
+MT5 bridge scripts (python_bridge), and bundled Python (runtime). That is normal for PyInstaller.
+
+1) Panel API URL (automatic for end users):
+   - Administrator copies panel_api_url.example.txt to panel_api_url.txt next to MT5RemoteAgent.exe
+     and replaces the URL line with your real panel address (tunnel https://... or LAN http://IP:3001).
+   - Or set environment variable MT5_AGENT_API_BASE (or PANEL_API_URL) before starting the agent.
+   Otherwise edit api_base in your config file or type it in the pairing window.
+
+   Also edit the agent config if needed:
+   - Installed under Program Files: %LOCALAPPDATA%\MT5RemoteAgent\config.json (created on first run).
+   - Portable folder copy: config.json next to MT5RemoteAgent.exe.
+   Set accounts: full paths to each MetaTrader terminal64.exe on this PC.
+
+2) First time — register this PC:
+   Double-click MT5RemoteAgent.exe. A pairing window opens: paste the code from the panel and click
+   Register. (PAIR_FIRST_RUN.bat is optional. Advanced: set PAIRING_CODE in cmd, or MT5_AGENT_NO_GUI=1 to
+   disable the window and use the console only.)
+
+3) After pairing, keep the small status window open or run the exe again — it will connect using saved
+   device_id and token in %LOCALAPPDATA%\MT5RemoteAgent\config.json.
+
+Keep this entire folder together when copying manually (_internal, python_bridge, runtime, config templates).

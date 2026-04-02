@@ -1,0 +1,9 @@
+# Copy this file to panel_api_url.txt (same folder as MT5RemoteAgent.exe).
+# Put your panel API URL on the next line — one line only, no quotes.
+# Examples:
+# https://your-subdomain.trycloudflare.com
+# http://192.168.1.50:3001
+#
+# The pairing window will fill "Panel API URL" from this file automatically.
+
+http://127.0.0.1:3001

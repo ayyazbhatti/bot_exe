@@ -1,0 +1,21 @@
+Backend build failed because the C++ linker (link.exe) is missing.
+
+To fix:
+1. Download "Build Tools for Visual Studio":
+   https://visualstudio.microsoft.com/visual-cpp-build-tools/
+   (Click "Download Build Tools")
+
+2. Run the installer. Select workload:
+   "Desktop development with C++"
+
+3. Install (takes a few GB and several minutes).
+
+4. Restart Cursor or open a NEW terminal (so PATH is updated).
+
+5. From C:\metabot run:
+   .\build-backend.ps1
+
+6. When that succeeds, run the panel:
+   Terminal 1: .\backend\target\release\mt5-panel-api.exe
+   Terminal 2: cd frontend; npm run dev -- --host
+   Browser: http://localhost:5173
