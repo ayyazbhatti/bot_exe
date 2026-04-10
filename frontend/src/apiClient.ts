@@ -8,11 +8,22 @@ const PANEL_KEY = import.meta.env.VITE_PANEL_API_KEY as string | undefined
 /**
  * Optional panel API origin in dev when Vite’s proxy is wrong or you want to skip it.
  * Example: `VITE_API_ORIGIN=http://127.0.0.1:3001` (must match the Rust server `PORT`, default 3001).
+ * Use scheme://host only — not `.../api`. Requests already use paths like `/api/...`; a trailing `/api`
+ * here would become `.../api/api/...` (404 on the panel).
  */
+function normalizePanelApiOrigin(raw: string): string {
+  let s = raw.trim().replace(/\/+$/, '')
+  if (!s) return ''
+  if (s.endsWith('/api')) {
+    s = s.slice(0, -4).replace(/\/+$/, '')
+  }
+  return s
+}
+
 export function apiOrigin(): string {
   const o = (import.meta.env.VITE_API_ORIGIN as string | undefined)?.trim()
   if (!o) return ''
-  return o.replace(/\/$/, '')
+  return normalizePanelApiOrigin(o)
 }
 
 /** Resolve `/api/...` to full URL when `VITE_API_ORIGIN` is set; otherwise keep a path for the Vite proxy. */

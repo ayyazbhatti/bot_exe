@@ -6,6 +6,7 @@ import json
 import math
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 
 
@@ -76,6 +77,88 @@ def _json_float(x, default=0.0):
         return v if math.isfinite(v) else default
     except (TypeError, ValueError):
         return default
+
+
+def _pips_stop_intent(sl_pips, tp_pips):
+    """True if caller asked for SL and/or TP via pips (used for strict verification / rollback)."""
+    want_sl = False
+    want_tp = False
+    try:
+        if sl_pips is not None and sl_pips != "" and float(sl_pips) > 0:
+            want_sl = True
+    except (TypeError, ValueError):
+        pass
+    try:
+        if tp_pips is not None and tp_pips != "" and float(tp_pips) > 0:
+            want_tp = True
+    except (TypeError, ValueError):
+        pass
+    return want_sl, want_tp
+
+
+def _position_stops_meet_intent(pos, want_sl, want_tp, *, point: float) -> bool:
+    """After SLTP, verify broker stored stops when we required them (MT5 uses 0 when unset)."""
+    eps = max(point * 0.5, 1e-9)
+    if want_sl and float(getattr(pos, "sl", 0) or 0) <= eps:
+        return False
+    if want_tp and float(getattr(pos, "tp", 0) or 0) <= eps:
+        return False
+    return True
+
+
+def _rollback_market_position(mt5, ticket: int, bridge_log) -> bool:
+    """Close an open market position by ticket (used when SL/TP cannot be applied)."""
+    positions = mt5.positions_get(ticket=ticket)
+    if not positions:
+        bridge_log(f"rollback: position {ticket} not found")
+        return False
+    pos = positions[0]
+    sym = pos.symbol
+    vol = pos.volume
+    if not mt5.symbol_select(sym, True):
+        bridge_log(f"rollback: symbol_select failed for {sym!r}")
+        return False
+    tick = mt5.symbol_info_tick(sym)
+    if tick is None:
+        bridge_log(f"rollback: no quote for {sym!r}")
+        return False
+    if pos.type == mt5.ORDER_TYPE_BUY:
+        close_type = mt5.ORDER_TYPE_SELL
+        cprice = tick.bid
+    else:
+        close_type = mt5.ORDER_TYPE_BUY
+        cprice = tick.ask
+    info = mt5.symbol_info(sym)
+    filling_mode = getattr(info, "filling_mode", 0) if info else 0
+    if filling_mode & 1:
+        type_filling = mt5.ORDER_FILLING_FOK
+    elif filling_mode & 2:
+        type_filling = mt5.ORDER_FILLING_IOC
+    elif filling_mode & 4:
+        type_filling = mt5.ORDER_FILLING_RETURN
+    else:
+        type_filling = mt5.ORDER_FILLING_RETURN
+    req = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": sym,
+        "volume": vol,
+        "type": close_type,
+        "price": cprice,
+        "deviation": 20,
+        "magic": pos.magic,
+        "comment": "rollback-no-stops",
+        "position": ticket,
+        "type_filling": type_filling,
+    }
+    res = mt5.order_send(req)
+    if res is None or res.retcode != mt5.TRADE_RETCODE_DONE:
+        bridge_log(
+            f"rollback FAILED ticket={ticket} retcode={getattr(res, 'retcode', None)!r} "
+            f"comment={getattr(res, 'comment', '')!r}"
+        )
+        return False
+    bridge_log(f"rollback OK ticket={ticket}")
+    return True
 
 
 def hint_for_retcode(retcode):
@@ -270,29 +353,47 @@ def main():
             def normalize_price(p):
                 return round(round(p / point) * point, digits)
 
-            for _ in (0,):  # single block so we can skip invalid one without clearing the other
-                if sl is not None:
-                    sl = normalize_price(sl)
+            def finalize_levels_quote(a_sl, a_tp, px_ref):
+                ns, nt = a_sl, a_tp
+                if ns is not None:
+                    ns = normalize_price(ns)
                     if min_dist_price > 0:
-                        if order_type == "buy" and price - sl < min_dist_price:
-                            sl = normalize_price(price - min_dist_price)
-                        elif order_type == "sell" and sl - price < min_dist_price:
-                            sl = normalize_price(price + min_dist_price)
-                    if order_type == "buy" and sl >= price:
-                        sl = None
-                    elif order_type == "sell" and sl <= price:
-                        sl = None
-                if tp is not None:
-                    tp = normalize_price(tp)
+                        if order_type == "buy" and px_ref - ns < min_dist_price:
+                            ns = normalize_price(px_ref - min_dist_price)
+                        elif order_type == "sell" and ns - px_ref < min_dist_price:
+                            ns = normalize_price(px_ref + min_dist_price)
+                    if order_type == "buy" and ns >= px_ref:
+                        ns = None
+                    elif order_type == "sell" and ns <= px_ref:
+                        ns = None
+                if nt is not None:
+                    nt = normalize_price(nt)
                     if min_dist_price > 0:
-                        if order_type == "buy" and tp - price < min_dist_price:
-                            tp = normalize_price(price + min_dist_price)
-                        elif order_type == "sell" and price - tp < min_dist_price:
-                            tp = normalize_price(price - min_dist_price)
-                    if order_type == "buy" and tp <= price:
-                        tp = None
-                    elif order_type == "sell" and tp >= price:
-                        tp = None
+                        if order_type == "buy" and nt - px_ref < min_dist_price:
+                            nt = normalize_price(px_ref + min_dist_price)
+                        elif order_type == "sell" and px_ref - nt < min_dist_price:
+                            nt = normalize_price(px_ref - min_dist_price)
+                    if order_type == "buy" and nt <= px_ref:
+                        nt = None
+                    elif order_type == "sell" and nt >= px_ref:
+                        nt = None
+                return ns, nt
+
+            sl, tp = finalize_levels_quote(sl, tp, price)
+
+            want_sl, want_tp = _pips_stop_intent(sl_pips, tp_pips)
+            strict_pips_stops = want_sl or want_tp
+            if strict_pips_stops and sl is None and tp is None:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "message": "SL/TP (pips) cannot be placed for the current quote (min distance / side). Order not sent.",
+                        },
+                    ),
+                )
+                sys.exit(1)
+            pre_sl, pre_tp = sl, tp
 
             # Set type_filling from symbol's allowed modes so it works across different brokers (e.g. Default vs EXNESS).
             # SYMBOL_FILLING_MODE is a bitmask (1=FOK, 2=IOC, 4=RETURN); we must use ORDER_FILLING_* in the request.
@@ -342,39 +443,188 @@ def main():
                 print(json.dumps(out))
                 sys.exit(1)
 
-            bridge_log(f"create_position order_send OK order_ticket={result.order}")
+            bridge_log(
+                f"create_position order_send OK order={getattr(result, 'order', None)} "
+                f"deal={getattr(result, 'deal', None)} position={getattr(result, 'position', None)}"
+            )
             _timing_log("AFTER_ORDER_SEND")
 
-            # Many brokers ignore SL/TP on the initial deal; set them via TRADE_ACTION_SLTP after open
-            if sl is not None or tp is not None:
-                positions = mt5.positions_get(symbol=symbol)
-                pos_ticket = None
-                if positions:
-                    # Use the newest position (highest ticket) for this symbol as the one we just opened
-                    pos = max(positions, key=lambda p: p.ticket)
-                    pos_ticket = pos.ticket
-                    mod_sl = float(sl) if sl is not None else pos.sl
-                    mod_tp = float(tp) if tp is not None else pos.tp
-                    mod_request = {
-                        "action": mt5.TRADE_ACTION_SLTP,
-                        "symbol": symbol,
-                        "position": pos_ticket,
-                        "sl": mod_sl,
-                        "tp": mod_tp,
-                    }
-                    mod_result = mt5.order_send(mod_request)
-                    bridge_log(f"create_position TRADE_ACTION_SLTP position={pos_ticket} sl={mod_sl} tp={mod_tp} mod_retcode={getattr(mod_result, 'retcode', None) if mod_result else None}")
-                    # If modify fails, position is still open; we don't fail the whole request
-                else:
-                    bridge_log("create_position TRADE_ACTION_SLTP skipped: no positions_get for symbol")
-            else:
-                bridge_log("create_position TRADE_ACTION_SLTP skipped: sl and tp both None")
+            # Post-open SL/TP: must succeed or we fail the operation (and roll back the naked position).
+            # Never report ok:true for a position that was supposed to have stops but does not.
+            must_set_stops = pre_sl is not None or pre_tp is not None
+            verify_sl = pre_sl is not None
+            verify_tp = pre_tp is not None
 
-            print(json.dumps({
-                "ok": True,
-                "message": "Order placed",
-                "order_ticket": result.order,
-            }))
+            if not must_set_stops:
+                bridge_log("create_position: no SL/TP to attach after open")
+                print(
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "message": "Order placed",
+                            "order_ticket": result.order,
+                        },
+                    ),
+                )
+            else:
+                result_order = int(getattr(result, "order", 0) or 0)
+                result_position = int(getattr(result, "position", 0) or 0)
+                primary_ids = []
+                seen_id = set()
+                for t in (result_position, result_order):
+                    if t > 0 and t not in seen_id:
+                        seen_id.add(t)
+                        primary_ids.append(t)
+
+                def resolve_opened_position_ticket():
+                    for cand in primary_ids:
+                        plist = mt5.positions_get(ticket=cand)
+                        if plist:
+                            return int(plist[0].ticket)
+                    plist_sym = mt5.positions_get(symbol=symbol)
+                    if not plist_sym:
+                        return None
+                    order_type_int_fb = mt5.ORDER_TYPE_BUY if order_type == "buy" else mt5.ORDER_TYPE_SELL
+                    step = float(vol_step)
+                    tol = max(step * 0.51, 1e-9)
+
+                    def vol_close(a: float, b: float) -> bool:
+                        if step >= 1:
+                            return abs(a - b) < 0.5
+                        return abs(a - b) <= tol + 1e-12
+
+                    matching = [
+                        p
+                        for p in plist_sym
+                        if p.type == order_type_int_fb and vol_close(float(p.volume), float(volume))
+                    ]
+                    if not matching:
+                        return None
+                    return int(max(matching, key=lambda p: p.ticket).ticket)
+
+                pos_ticket = None
+                for _attempt in range(55):
+                    pos_ticket = resolve_opened_position_ticket()
+                    if pos_ticket:
+                        break
+                    time.sleep(0.05)
+
+                def levels_from_entry(entry_px):
+                    rs, rt = None, None
+                    try:
+                        if sl_pips is not None and float(sl_pips) > 0:
+                            spf = float(sl_pips)
+                            if order_type == "buy":
+                                rs = round(entry_px - spf * pip_size, digits)
+                            else:
+                                rs = round(entry_px + spf * pip_size, digits)
+                        if tp_pips is not None and float(tp_pips) > 0:
+                            tpf = float(tp_pips)
+                            if order_type == "buy":
+                                rt = round(entry_px + tpf * pip_size, digits)
+                            else:
+                                rt = round(entry_px - tpf * pip_size, digits)
+                    except (TypeError, ValueError):
+                        return None, None
+                    return rs, rt
+
+                sltp_ok = False
+                if not pos_ticket:
+                    bridge_log(
+                        "create_position: could not resolve position ticket for SL/TP "
+                        f"(symbol={symbol!r} primary_ids={primary_ids})",
+                    )
+                else:
+
+                    def one_sltp_round() -> bool:
+                        plist = mt5.positions_get(ticket=pos_ticket)
+                        if not plist:
+                            return False
+                        pos = plist[0]
+                        entry = float(pos.price_open)
+                        tick_r = mt5.symbol_info_tick(symbol)
+                        if tick_r is None:
+                            return False
+                        px_ref = tick_r.ask if order_type == "buy" else tick_r.bid
+
+                        if want_sl or want_tp:
+                            r_sl, r_tp = levels_from_entry(entry)
+                        else:
+                            r_sl, r_tp = pre_sl, pre_tp
+                        r_sl, r_tp = finalize_levels_quote(r_sl, r_tp, px_ref)
+
+                        if verify_sl and r_sl is None:
+                            bridge_log("create_position SLTP: SL invalid after finalize vs quote, will retry")
+                            return False
+                        if verify_tp and r_tp is None:
+                            bridge_log("create_position SLTP: TP invalid after finalize vs quote, will retry")
+                            return False
+
+                        mod_sl_f = float(r_sl) if r_sl is not None else float(pos.sl or 0.0)
+                        mod_tp_f = float(r_tp) if r_tp is not None else float(pos.tp or 0.0)
+                        mod_request = {
+                            "action": mt5.TRADE_ACTION_SLTP,
+                            "symbol": symbol,
+                            "position": pos_ticket,
+                            "sl": mod_sl_f,
+                            "tp": mod_tp_f,
+                        }
+                        mod_result = mt5.order_send(mod_request)
+                        mod_rc = getattr(mod_result, "retcode", None) if mod_result else None
+                        mod_cm = getattr(mod_result, "comment", "") if mod_result else ""
+                        bridge_log(
+                            f"create_position TRADE_ACTION_SLTP position={pos_ticket} sl={mod_sl_f} tp={mod_tp_f} "
+                            f"mod_retcode={mod_rc} comment={mod_cm!r}"
+                        )
+                        if mod_result is None or mod_rc != mt5.TRADE_RETCODE_DONE:
+                            return False
+                        plist_v = mt5.positions_get(ticket=pos_ticket)
+                        if not plist_v:
+                            return False
+                        return _position_stops_meet_intent(plist_v[0], verify_sl, verify_tp, point=point)
+
+                    for attempt in range(12):
+                        if one_sltp_round():
+                            sltp_ok = True
+                            break
+                        time.sleep(0.06 + min(attempt, 6) * 0.035)
+
+                if not sltp_ok:
+                    rolled = False
+                    if pos_ticket:
+                        rolled = _rollback_market_position(mt5, pos_ticket, bridge_log)
+                    err_body = {
+                        "ok": False,
+                        "message": (
+                            "SL/TP could not be applied and confirmed; position was closed (rollback)."
+                            if rolled
+                            else (
+                                "SL/TP could not be applied; rollback failed or ticket unknown — close manually if a position exists."
+                            )
+                        ),
+                        "order_ticket": getattr(result, "order", None),
+                        "position_ticket": pos_ticket,
+                        "rollback_ok": rolled,
+                    }
+                    if not pos_ticket:
+                        err_body["message"] = (
+                            "Order may have executed but position ticket was not found to set SL/TP. "
+                            "Check MT5 for a naked position; panel will report failure."
+                        )
+                    print(json.dumps(err_body, allow_nan=False))
+                    sys.exit(1)
+
+                print(
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "message": "Order placed",
+                            "order_ticket": result.order,
+                            "position_ticket": pos_ticket,
+                        },
+                        allow_nan=False,
+                    ),
+                )
 
         elif action == "close_position":
             ticket = body.get("ticket")
