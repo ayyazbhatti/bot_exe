@@ -34,6 +34,40 @@ const API = '/api'
 /** Synthetic device id for rows from `/ws/positions` (MT5 on the panel server). */
 const LOCAL_DEVICE_ID = '__local__'
 const LIVEPOSITIONS_DEVICE_KEY = 'livepositions_selected_remote_device'
+const BASKET_MAX_PROFIT_STORAGE = 'livepositions_basket_max_profit'
+const BASKET_MAX_LOSS_STORAGE = 'livepositions_basket_max_loss'
+/** Same storage key as Remote Agents — needed to enqueue remote close commands. */
+const AGENT_ADMIN_KEY_STORAGE = 'mt5bot_agent_admin_key'
+
+function loadStoredBasketMaxProfit(): string {
+  try {
+    const s = localStorage.getItem(BASKET_MAX_PROFIT_STORAGE)
+    if (s == null) return ''
+    return String(s)
+  } catch {
+    return ''
+  }
+}
+
+function loadStoredBasketMaxLoss(): string {
+  try {
+    const s = localStorage.getItem(BASKET_MAX_LOSS_STORAGE)
+    if (s == null) return ''
+    return String(s)
+  } catch {
+    return ''
+  }
+}
+
+function readAgentAdminKey(): string {
+  try {
+    const env = import.meta.env.VITE_AGENT_ADMIN_KEY
+    if (typeof env === 'string' && env.trim()) return env.trim()
+    return (localStorage.getItem(AGENT_ADMIN_KEY_STORAGE) ?? '').trim()
+  } catch {
+    return ''
+  }
+}
 
 type DeviceApi = {
   device_id: string
@@ -694,6 +728,136 @@ export default function BotLivePositions() {
     return `${selectedScopeIds.length} accounts selected`
   }, [allAccountsForFilter, selectedScopeIds])
 
+  /** Basket guard: optional overall P/L limits → close everything in the current filter. */
+  const [basketMaxProfit, setBasketMaxProfit] = useState(loadStoredBasketMaxProfit)
+  const [basketMaxLoss, setBasketMaxLoss] = useState(loadStoredBasketMaxLoss)
+  const [basketAutoTripped, setBasketAutoTripped] = useState(false)
+  const [basketGuardBanner, setBasketGuardBanner] = useState<{ type: 'ok' | 'err'; text: string } | null>(null)
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(BASKET_MAX_PROFIT_STORAGE, basketMaxProfit)
+      localStorage.setItem(BASKET_MAX_LOSS_STORAGE, basketMaxLoss)
+    } catch {
+      /* ignore */
+    }
+  }, [basketMaxProfit, basketMaxLoss])
+
+  const basketFiringRef = useRef(false)
+  const parsedBasketInitRef = useRef(false)
+  const parsedBasketTpRef = useRef<number | null>(null)
+  const parsedBasketSlRef = useRef<number | null>(null)
+
+  const parsedBasketTp = useMemo(() => {
+    const t = basketMaxProfit.trim()
+    if (!t) return null
+    const n = Number(t)
+    if (!Number.isFinite(n) || n <= 0) return null
+    return n
+  }, [basketMaxProfit])
+
+  const parsedBasketSl = useMemo(() => {
+    const t = basketMaxLoss.trim()
+    if (!t) return null
+    const n = Number(t)
+    if (!Number.isFinite(n) || n <= 0) return null
+    return n
+  }, [basketMaxLoss])
+
+  useEffect(() => {
+    if (!parsedBasketInitRef.current) {
+      parsedBasketInitRef.current = true
+      parsedBasketTpRef.current = parsedBasketTp
+      parsedBasketSlRef.current = parsedBasketSl
+      return
+    }
+    const prevTp = parsedBasketTpRef.current
+    const prevSl = parsedBasketSlRef.current
+    if (prevTp !== parsedBasketTp || prevSl !== parsedBasketSl) {
+      setBasketAutoTripped(false)
+      setBasketGuardBanner(null)
+    }
+    parsedBasketTpRef.current = parsedBasketTp
+    parsedBasketSlRef.current = parsedBasketSl
+  }, [parsedBasketTp, parsedBasketSl])
+
+  const executeBasketCloseAll = useCallback(async (rows: RemoteLiveAccountRow[]) => {
+    const byDevice = new Map<string, string[]>()
+    for (const r of rows) {
+      const aid = String(r.account_id ?? '').trim()
+      if (!aid) continue
+      if (!byDevice.has(r.device_id)) byDevice.set(r.device_id, [])
+      const list = byDevice.get(r.device_id)!
+      if (!list.includes(aid)) list.push(aid)
+    }
+    if (byDevice.size === 0) {
+      return { ok: false, message: 'No accounts in the current view to close.' }
+    }
+
+    const pieces: string[] = []
+    let anyOk = false
+    let anyFail = false
+
+    const localIds = byDevice.get(LOCAL_DEVICE_ID)
+    if (localIds?.length) {
+      try {
+        const r = await apiFetch(apiUrl(`${API}/positions/close-selected`), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ account_ids: localIds }),
+        })
+        const data = await r.json().catch(() => ({}))
+        if (r.ok && data?.ok) {
+          anyOk = true
+          pieces.push(`This panel: ${data?.message ?? 'ok'}`)
+        } else {
+          anyFail = true
+          pieces.push(`This panel: ${data?.error ?? data?.message ?? `HTTP ${r.status}`}`)
+        }
+      } catch {
+        anyFail = true
+        pieces.push('This panel: request failed')
+      }
+    }
+
+    const adminKey = readAgentAdminKey()
+    for (const [deviceId, account_ids] of byDevice) {
+      if (deviceId === LOCAL_DEVICE_ID) continue
+      if (!adminKey) {
+        anyFail = true
+        pieces.push(`Remote: set agent admin key (Remote devices page) to close device ${deviceId.slice(0, 8)}…`)
+        continue
+      }
+      try {
+        const r = await apiFetch(apiUrl(`${API}/agent/commands/enqueue`), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            admin_key: adminKey,
+            device_id: deviceId,
+            type: 'close_positions_selected',
+            ttl_sec: 600,
+            payload: { account_ids },
+          }),
+        })
+        const data = await r.json().catch(() => ({}))
+        if (r.ok && data?.ok) {
+          anyOk = true
+          pieces.push(`Remote queued (${account_ids.length} acct): ${deviceId.slice(0, 8)}…`)
+        } else {
+          anyFail = true
+          pieces.push(`Remote ${deviceId.slice(0, 8)}…: ${data?.error ?? data?.message ?? r.status}`)
+        }
+      } catch {
+        anyFail = true
+        pieces.push(`Remote ${deviceId.slice(0, 8)}…: request failed`)
+      }
+    }
+
+    const ok = !anyFail && anyOk
+    return { ok, message: pieces.join(' · ') }
+  }, [])
+
   const { filteredResults, accountSelectionMismatch } = useMemo(() => {
     if (selectedScopeIds.length === 0) {
       return { filteredResults: scopedRows, accountSelectionMismatch: false }
@@ -720,6 +884,47 @@ export default function BotLivePositions() {
     (sum, a) => sum + a.positions.reduce((s, p) => s + (p.profit ?? 0), 0),
     0,
   )
+
+  const filteredResultsForBasketRef = useRef(filteredResults)
+  filteredResultsForBasketRef.current = filteredResults
+
+  useEffect(() => {
+    if (basketAutoTripped) return
+    if (totalCount === 0) return
+    if (parsedBasketTp == null && parsedBasketSl == null) return
+
+    const hitProfit = parsedBasketTp != null && combinedPnl >= parsedBasketTp
+    const hitLoss = parsedBasketSl != null && combinedPnl <= -parsedBasketSl
+    if (!hitProfit && !hitLoss) return
+    if (basketFiringRef.current) return
+    basketFiringRef.current = true
+    const hit: 'profit' | 'loss' = hitProfit ? 'profit' : 'loss'
+    const rows = filteredResultsForBasketRef.current
+
+    void (async () => {
+      try {
+        const { ok, message } = await executeBasketCloseAll(rows)
+        setBasketGuardBanner({
+          type: ok ? 'ok' : 'err',
+          text: ok
+            ? `Auto-close (${hit === 'profit' ? 'max profit' : 'max loss'}): ${message}`
+            : `Auto-close failed: ${message}`,
+        })
+      } catch {
+        setBasketGuardBanner({ type: 'err', text: 'Auto-close request failed.' })
+      } finally {
+        setBasketAutoTripped(true)
+        basketFiringRef.current = false
+      }
+    })()
+  }, [
+    combinedPnl,
+    totalCount,
+    parsedBasketTp,
+    parsedBasketSl,
+    basketAutoTripped,
+    executeBasketCloseAll,
+  ])
 
   const bridgeErrorGroups = useMemo(() => buildBridgeErrorGroups(filteredResults), [filteredResults])
 
@@ -789,13 +994,6 @@ export default function BotLivePositions() {
       <div className="live-page-header">
         <div>
           <h2 className="live-page-title">Live positions</h2>
-          <p className="settings-hint" style={{ marginTop: 0, marginBottom: '0.75rem' }}>
-            <strong>This panel</strong> loads MT5 on the API host via WebSocket (<code>/ws/positions</code>) with{' '}
-            <strong>HTTP backup</strong> every 2.5s when a stream is disconnected, every 30s when WebSockets are connected (
-            <code>/api/positions/all</code>, <code>/api/agent/remote-positions</code>).
-            Remote rows use <code>/ws/remote-positions</code>. If you see nothing, set Device to <strong>All devices</strong>{' '}
-            or <strong>This panel (local MT5)</strong> — a stale saved device filter can hide everything.
-          </p>
           {devicesLoadError && (
             <p className="empty" style={{ marginBottom: '0.75rem', color: 'var(--danger, #f87171)' }}>
               {devicesLoadError}
@@ -868,6 +1066,60 @@ export default function BotLivePositions() {
               onUnselectAll={unselectAllAccountsInDropdown}
             />
           )}
+          <div className="live-basket-guard remote-form-surface">
+            <div className="remote-form-group" style={{ marginBottom: 0 }}>
+              <h3 className="remote-form-group__title">Basket auto-close</h3>
+              <p className="live-basket-guard__hint muted">
+                Uses the same overall P/L as below. Empty field = that side off. After a trigger, use Re-arm (or change a
+                limit). Remote PCs need the agent admin key saved on Remote devices.
+              </p>
+              <div className="live-threshold-chip">
+                <div className="form-row remote-form-field">
+                  <label htmlFor="live-basket-max-profit">Max profit ($)</label>
+                  <input
+                    id="live-basket-max-profit"
+                    type="number"
+                    min={0}
+                    step="any"
+                    placeholder="—"
+                    value={basketMaxProfit}
+                    onChange={(e) => setBasketMaxProfit(e.target.value)}
+                  />
+                </div>
+                <div className="form-row remote-form-field">
+                  <label htmlFor="live-basket-max-loss">Max loss ($)</label>
+                  <input
+                    id="live-basket-max-loss"
+                    type="number"
+                    min={0}
+                    step="any"
+                    placeholder="—"
+                    value={basketMaxLoss}
+                    onChange={(e) => setBasketMaxLoss(e.target.value)}
+                  />
+                </div>
+                <button
+                  type="button"
+                  className="live-basket-guard__rearm"
+                  disabled={!basketAutoTripped}
+                  onClick={() => {
+                    setBasketAutoTripped(false)
+                    setBasketGuardBanner(null)
+                  }}
+                >
+                  Re-arm
+                </button>
+              </div>
+              {basketGuardBanner && (
+                <p
+                  className={`live-basket-guard__banner ${basketGuardBanner.type === 'ok' ? 'live-basket-guard__banner--ok' : 'live-basket-guard__banner--err'}`}
+                  role="status"
+                >
+                  {basketGuardBanner.text}
+                </p>
+              )}
+            </div>
+          </div>
           <p className="live-status">
             <span className={localConnected ? 'connected' : 'disconnected'} title="/ws/positions">
               {localConnected ? '●' : '○'} Local panel

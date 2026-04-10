@@ -27,7 +27,7 @@ use axum::http::HeaderValue;
 use tower_governor::GovernorLayer;
 use tower_governor::governor::GovernorConfigBuilder;
 use tower_governor::key_extractor::SmartIpKeyExtractor;
-use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, Any, CorsLayer};
+use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use subtle::ConstantTimeEq;
@@ -67,17 +67,43 @@ fn api_local_base() -> String {
     format!("http://127.0.0.1:{}", listen_port())
 }
 
-/// If `CORS_ALLOWED_ORIGINS` is empty or unset, allow any origin (dev). Otherwise comma‑separated list, e.g. `http://localhost:5173,https://panel.example.com`.
+/// Comma‑separated browser origins, e.g. `http://localhost:5173,https://panel.example.com`.
+///
+/// If unset or empty: defaults to local Vite / preview hosts only (see `DEFAULT_BROWSER_DEV_ORIGINS`).
+/// That avoids `Access-Control-Allow-Origin: *`, which browsers reject when `fetch(..., credentials: 'include')`
+/// is used — the common case when the UI is on `http://localhost:5173` and `VITE_API_ORIGIN` points at a tunnel.
 fn build_cors_layer() -> CorsLayer {
+    const DEFAULT_BROWSER_DEV_ORIGINS: &[&str] = &[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://[::1]:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+        "http://[::1]:4173",
+    ];
+
     let raw = std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_default();
-    let origins: Vec<HeaderValue> = raw
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
+    // Always allow local dev origins; then append explicit env origins.
+    // This prevents lock-outs when CORS_ALLOWED_ORIGINS is set for tunnels/domains
+    // but the browser UI is still opened from localhost.
+    let mut origin_strings: Vec<String> = DEFAULT_BROWSER_DEV_ORIGINS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    origin_strings.extend(
+        raw.split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+    );
+    origin_strings.sort();
+    origin_strings.dedup();
+    let origins: Vec<HeaderValue> = origin_strings
+        .iter()
         .filter_map(|s| HeaderValue::from_str(s).ok())
         .collect();
 
-    // With `allow_credentials(true)`, tower-http rejects `Any` for methods or headers — use explicit lists.
+    // `allow_credentials(true)` requires concrete `Access-Control-Allow-Origin` (not `*`).
     let credentialed_methods = AllowMethods::list([
         Method::GET,
         Method::POST,
@@ -93,18 +119,11 @@ fn build_cors_layer() -> CorsLayer {
         HeaderName::from_static("x-panel-api-key"),
     ]);
 
-    if origins.is_empty() {
-        CorsLayer::new()
-            .allow_methods(Any)
-            .allow_headers(Any)
-            .allow_origin(Any)
-    } else {
-        CorsLayer::new()
-            .allow_methods(credentialed_methods)
-            .allow_headers(credentialed_headers)
-            .allow_origin(AllowOrigin::list(origins))
-            .allow_credentials(true)
-    }
+    CorsLayer::new()
+        .allow_methods(credentialed_methods)
+        .allow_headers(credentialed_headers)
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_credentials(true)
 }
 
 /// When set, all `/api/*` and `/ws/*` require this key except health, CORS preflight, and agent device endpoints.
@@ -267,6 +286,26 @@ fn path_for_clone_account_id(account_id: &str) -> Option<String> {
     }
 }
 
+/// Remote agent / UI ids like `exness_clone_001` → `clone:EXNESS_clone_001` if that folder exists, else
+/// default Exness install (agent dist config often maps `exness_clone_001` to main EXNESS, not a robocopy clone).
+fn path_for_exness_clone_style_account_id(account_id: &str) -> Option<String> {
+    let rest = account_id.strip_prefix("exness_clone_")?;
+    if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let n: u32 = rest.parse().ok()?;
+    let folder = format!("EXNESS_clone_{:03}", n);
+    if let Some(p) = path_for_clone_account_id(&format!("clone:{}", folder)) {
+        return Some(p);
+    }
+    let exe = default_exness_install_dir().join("terminal64.exe");
+    if exe.is_file() {
+        Some(exe.to_string_lossy().into_owned())
+    } else {
+        None
+    }
+}
+
 /// Each entry: (account_id, label) for clone folders that contain `terminal64.exe`.
 fn collect_clone_accounts() -> Vec<(String, String)> {
     let parent = default_exness_clone_parent_dir();
@@ -326,6 +365,7 @@ fn get_path_for_account(_state: &AppState, account_id: &str) -> Option<String> {
     get_terminal_path_static(account_id)
         .map(String::from)
         .or_else(|| path_for_clone_account_id(account_id))
+        .or_else(|| path_for_exness_clone_style_account_id(account_id))
 }
 
 fn get_watcher_close_url(_state: &AppState, account_id: &str) -> String {
@@ -618,7 +658,7 @@ impl RemotePositionsHub {
         Ok(())
     }
 
-    fn account_row_merge_key(row: &serde_json::Value) -> Result<String, String> {
+    pub(crate) fn account_row_merge_key(row: &serde_json::Value) -> Result<String, String> {
         match row.get("account_id") {
             Some(serde_json::Value::String(s)) => {
                 let t = s.trim();
@@ -710,6 +750,159 @@ impl RemotePositionsHub {
     }
 }
 
+/// Merged `history_deals` snapshots from desktop agents (`history_deals_snapshot` on `/ws/agent/device`).
+struct RemoteHistoryHub {
+    cache: Mutex<HashMap<String, serde_json::Value>>,
+    tx: broadcast::Sender<String>,
+}
+
+impl RemoteHistoryHub {
+    fn new() -> Arc<Self> {
+        let (tx, _) = broadcast::channel::<String>(256);
+        Arc::new(Self {
+            cache: Mutex::new(HashMap::new()),
+            tx,
+        })
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<String> {
+        self.tx.subscribe()
+    }
+
+    fn snapshot_json(&self, agent: &Mutex<agent::AgentStore>) -> String {
+        let cache = self.cache.lock().unwrap();
+        let store = agent.lock().unwrap();
+        let devices = store.list_devices();
+        drop(store);
+        let mut flat: Vec<serde_json::Value> = Vec::new();
+        for (dev_id, results_val) in cache.iter() {
+            let dev_label = devices
+                .iter()
+                .find_map(|d| {
+                    if d.get("device_id").and_then(|x| x.as_str()) == Some(dev_id.as_str()) {
+                        d.get("label")
+                            .and_then(|x| x.as_str())
+                            .map(std::string::ToString::to_string)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| dev_id.clone());
+            if let Some(arr) = results_val.as_array() {
+                for row in arr {
+                    let Some(mut o) = row.as_object().cloned() else {
+                        continue;
+                    };
+                    o.insert("device_id".to_string(), serde_json::json!(dev_id));
+                    o.insert("device_label".to_string(), serde_json::json!(dev_label));
+                    flat.push(serde_json::Value::Object(o));
+                }
+            }
+        }
+        serde_json::json!({ "ok": true, "source": "remote_history", "results": flat }).to_string()
+    }
+
+    fn validate_history_snapshot_rows(arr: &[serde_json::Value]) -> Result<(), String> {
+        if arr.len() > agent::MAX_REMOTE_DEVICE_TERMINALS {
+            return Err(format!(
+                "too many accounts in history snapshot (max {})",
+                agent::MAX_REMOTE_DEVICE_TERMINALS
+            ));
+        }
+        const MAX_DEALS_PER_ACCOUNT: usize = 600;
+        for v in arr {
+            let deals: Vec<serde_json::Value> = match v.get("deals") {
+                None | Some(serde_json::Value::Null) => Vec::new(),
+                Some(serde_json::Value::Array(a)) => a.clone(),
+                Some(_) => {
+                    return Err("each row deals must be an array or omitted".to_string());
+                }
+            };
+            if deals.len() > MAX_DEALS_PER_ACCOUNT {
+                return Err(format!(
+                    "too many deals in one account (max {})",
+                    MAX_DEALS_PER_ACCOUNT
+                ));
+            }
+            if !account_id_field_present(v) {
+                return Err("each row needs account_id".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn set_device_results(
+        &self,
+        agent: &Mutex<agent::AgentStore>,
+        device_id: &str,
+        results: serde_json::Value,
+    ) -> Result<(), String> {
+        let arr = results
+            .as_array()
+            .ok_or_else(|| "results must be an array".to_string())?;
+        Self::validate_history_snapshot_rows(arr)?;
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(device_id.to_string(), results);
+        let s = self.snapshot_json(agent);
+        let _ = self.tx.send(s);
+        Ok(())
+    }
+
+    fn merge_device_results(
+        &self,
+        agent: &Mutex<agent::AgentStore>,
+        device_id: &str,
+        results: serde_json::Value,
+    ) -> Result<(), String> {
+        let partial = results
+            .as_array()
+            .ok_or_else(|| "results must be an array".to_string())?;
+        Self::validate_history_snapshot_rows(partial)?;
+        let mut merged_map: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+        {
+            let cache = self.cache.lock().unwrap();
+            if let Some(serde_json::Value::Array(existing)) = cache.get(device_id) {
+                for row in existing {
+                    let k = RemotePositionsHub::account_row_merge_key(row)?;
+                    merged_map.insert(k, row.clone());
+                }
+            }
+        }
+        for row in partial {
+            let k = RemotePositionsHub::account_row_merge_key(row)?;
+            merged_map.insert(k, row.clone());
+        }
+        if merged_map.len() > agent::MAX_REMOTE_DEVICE_TERMINALS {
+            return Err(format!(
+                "too many accounts after merge (max {})",
+                agent::MAX_REMOTE_DEVICE_TERMINALS
+            ));
+        }
+        let mut merged_vec: Vec<serde_json::Value> = merged_map.into_values().collect();
+        merged_vec.sort_by(|a, b| {
+            let ka = RemotePositionsHub::account_row_merge_key(a).unwrap_or_default();
+            let kb = RemotePositionsHub::account_row_merge_key(b).unwrap_or_default();
+            ka.cmp(&kb)
+        });
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(device_id.to_string(), serde_json::Value::Array(merged_vec));
+        let s = self.snapshot_json(agent);
+        let _ = self.tx.send(s);
+        Ok(())
+    }
+
+    fn remove_device(&self, agent: &Mutex<agent::AgentStore>, device_id: &str) {
+        self.cache.lock().unwrap().remove(device_id);
+        let s = self.snapshot_json(agent);
+        let _ = self.tx.send(s);
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pairs: Arc<Mutex<Vec<PositionPair>>>,
@@ -735,6 +928,7 @@ pub struct AppState {
     pub agent_admin_key: Arc<Mutex<String>>,
     pub agent_admin_key_file: PathBuf,
     remote_positions: Arc<RemotePositionsHub>,
+    remote_history: Arc<RemoteHistoryHub>,
     /// Latest `/ws/positions` JSON so new WebSocket subscribers get data immediately (avoids empty UI until next tick).
     positions_last_broadcast: Arc<Mutex<Option<String>>>,
 }
@@ -765,6 +959,28 @@ impl AppState {
 
     pub(crate) fn remote_positions_clear_device(&self, device_id: &str) {
         self.remote_positions.remove_device(&self.agent, device_id);
+    }
+
+    pub(crate) fn remote_history_apply_snapshot(
+        &self,
+        device_id: &str,
+        results: serde_json::Value,
+    ) -> Result<(), String> {
+        self.remote_history
+            .set_device_results(&self.agent, device_id, results)
+    }
+
+    pub(crate) fn remote_history_merge_snapshot(
+        &self,
+        device_id: &str,
+        results: serde_json::Value,
+    ) -> Result<(), String> {
+        self.remote_history
+            .merge_device_results(&self.agent, device_id, results)
+    }
+
+    pub(crate) fn remote_history_clear_device(&self, device_id: &str) {
+        self.remote_history.remove_device(&self.agent, device_id);
     }
 
     fn emit_agent_hub_refresh(&self) {
@@ -1131,6 +1347,7 @@ async fn main() {
     let positions_tx_for_loop = positions_tx.clone();
     let (agent_hub_tx, _) = broadcast::channel::<String>(256);
     let remote_positions = RemotePositionsHub::new();
+    let remote_history = RemoteHistoryHub::new();
     let state = AppState {
         pairs: Arc::new(Mutex::new(pairs)),
         pair_file: pair_file.clone(),
@@ -1149,6 +1366,7 @@ async fn main() {
         agent_admin_key: Arc::new(Mutex::new(initial_agent_admin_key)),
         agent_admin_key_file: agent_admin_key_file.clone(),
         remote_positions: remote_positions.clone(),
+        remote_history: remote_history.clone(),
         positions_last_broadcast: Arc::new(Mutex::new(None)),
     };
     tokio::spawn(positions_broadcast_loop(positions_tx_for_loop, state.clone()));
@@ -1173,10 +1391,13 @@ async fn main() {
         .route("/api/health", get(health))
         .route("/ws/positions", get(ws_positions))
         .route("/ws/remote-positions", get(ws_remote_positions))
+        .route("/ws/remote-history", get(ws_remote_history))
+        .route("/ws/local-symbol-ticks", get(ws_local_symbol_ticks))
         .route("/ws/agent", get(ws_agent_hub))
         .route("/ws/agent/device", get(agent::ws_agent_device))
         .route("/api/accounts", get(accounts_list))
         .route("/api/symbols", get(symbols))
+        .route("/api/local/symbol-ticks", get(local_symbol_ticks))
         .route("/api/positions", get(positions))
         .route("/api/positions/all", get(positions_all))
         .route("/api/positions/close-all", post(positions_close_all))
@@ -1233,6 +1454,7 @@ async fn main() {
             "/api/agent/remote-positions",
             get(agent_remote_positions_snapshot_get),
         )
+        .route("/api/agent/remote-history", get(agent_remote_history_snapshot_get))
         .route(
             "/api/agent/devices/delete",
             post(agent::agent_delete_device),
@@ -1242,6 +1464,7 @@ async fn main() {
             post(agent::agent_revoke_device),
         )
         .route("/api/agent/commands/list", post(agent::agent_list_commands))
+        .route("/api/agent/commands/clear", post(agent::agent_commands_clear))
         .route("/api/agent/worker/set", post(agent::agent_worker_set))
         .route("/api/agent/worker/get", post(agent::agent_worker_get))
         .route(
@@ -1548,6 +1771,10 @@ async fn ws_remote_positions(ws: WebSocketUpgrade, State(state): State<AppState>
     ws.on_upgrade(move |socket| handle_remote_positions_socket(socket, state))
 }
 
+async fn ws_remote_history(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_remote_history_socket(socket, state))
+}
+
 async fn handle_remote_positions_socket(mut socket: WebSocket, state: AppState) {
     use broadcast::error::RecvError;
     let initial = state.remote_positions.snapshot_json(&state.agent);
@@ -1565,6 +1792,31 @@ async fn handle_remote_positions_socket(mut socket: WebSocket, state: AppState) 
             Err(RecvError::Lagged(_)) => {
                 // Skipped messages; push current merged snapshot so the client is not stuck on stale/empty JSON.
                 let resync = state.remote_positions.snapshot_json(&state.agent);
+                if socket.send(Message::Text(resync.into())).await.is_err() {
+                    break;
+                }
+            }
+            Err(RecvError::Closed) => break,
+        }
+    }
+}
+
+async fn handle_remote_history_socket(mut socket: WebSocket, state: AppState) {
+    use broadcast::error::RecvError;
+    let initial = state.remote_history.snapshot_json(&state.agent);
+    if socket.send(Message::Text(initial.into())).await.is_err() {
+        return;
+    }
+    let mut rx = state.remote_history.subscribe();
+    loop {
+        match rx.recv().await {
+            Ok(msg) => {
+                if socket.send(Message::Text(msg.into())).await.is_err() {
+                    break;
+                }
+            }
+            Err(RecvError::Lagged(_)) => {
+                let resync = state.remote_history.snapshot_json(&state.agent);
                 if socket.send(Message::Text(resync.into())).await.is_err() {
                     break;
                 }
@@ -1600,6 +1852,136 @@ async fn handle_positions_socket(mut socket: WebSocket, state: AppState) {
                 }
             }
             Err(RecvError::Closed) => break,
+        }
+    }
+}
+
+/// Parse client `{"symbols":["EURUSDm"]}` or `{"symbols":"EURUSDm,GBPUSDm"}` for `/ws/local-symbol-ticks`.
+fn parse_local_symbol_ticks_ws_subscribe(txt: &str) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(txt).ok()?;
+    if let Some(arr) = v.get("symbols").and_then(|x| x.as_array()) {
+        let out: Vec<String> = arr
+            .iter()
+            .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .take(48)
+            .collect();
+        return Some(out);
+    }
+    if let Some(s) = v.get("symbols").and_then(|x| x.as_str()) {
+        let out: Vec<String> = s
+            .split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .take(48)
+            .collect();
+        return Some(out);
+    }
+    None
+}
+
+#[derive(Deserialize)]
+struct LocalSymbolTicksWsQuery {
+    #[serde(default)]
+    account_id: Option<String>,
+    /// Optional initial comma-separated symbols (client may send `symbols` JSON after connect).
+    #[serde(default)]
+    symbols: Option<String>,
+}
+
+async fn ws_local_symbol_ticks(
+    ws: WebSocketUpgrade,
+    Query(q): Query<LocalSymbolTicksWsQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_local_symbol_ticks_socket(socket, state, q))
+}
+
+async fn handle_local_symbol_ticks_socket(mut socket: WebSocket, state: AppState, q: LocalSymbolTicksWsQuery) {
+    use tokio::time::{self, MissedTickBehavior};
+
+    let account_id = match resolve_account_id(&state, q.account_id.clone()) {
+        Ok(id) => id,
+        Err(e) => {
+            let frame = serde_json::json!({ "ok": false, "error": e }).to_string();
+            let _ = socket.send(Message::Text(frame.into())).await;
+            let _ = socket.close().await;
+            return;
+        }
+    };
+    let path = match get_path_for_account(&state, &account_id) {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            let frame = serde_json::json!({ "ok": false, "error": "no terminal path configured for this account_id" }).to_string();
+            let _ = socket.send(Message::Text(frame.into())).await;
+            let _ = socket.close().await;
+            return;
+        }
+    };
+
+    let mut symbols: Vec<String> = q
+        .symbols
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .take(48)
+        .collect();
+
+    let welcome = serde_json::json!({
+        "ok": true,
+        "type": "local_symbol_ticks_subscribed",
+        "account_id": account_id,
+    });
+    if socket.send(Message::Text(welcome.to_string().into())).await.is_err() {
+        return;
+    }
+
+    const LOCAL_TICKS_WS_INTERVAL_MS: u64 = 500;
+    const LOCAL_TICKS_WS_TIMEOUT_MS: u64 = 3000;
+
+    let mut interval = time::interval(Duration::from_millis(LOCAL_TICKS_WS_INTERVAL_MS));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            msg = socket.recv() => {
+                match msg {
+                    None => break,
+                    Some(Ok(Message::Text(txt))) => {
+                        let s = txt.to_string();
+                        if let Some(next) = parse_local_symbol_ticks_ws_subscribe(&s) {
+                            symbols = next;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = socket.send(Message::Pong(p)).await;
+                    }
+                    Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+            _ = interval.tick() => {
+                if symbols.is_empty() {
+                    continue;
+                }
+                let body = serde_json::json!({ "symbols": symbols }).to_string();
+                let path_c = path.clone();
+                let tick_res = tokio::task::spawn_blocking(move || {
+                    call_python_bridge_with_timeout("symbol_ticks", &body, &path_c, LOCAL_TICKS_WS_TIMEOUT_MS)
+                })
+                .await;
+                let out = match tick_res {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => serde_json::json!({ "ok": false, "error": e }).to_string(),
+                    Err(_) => serde_json::json!({ "ok": false, "error": "symbol_ticks task failed" }).to_string(),
+                };
+                if socket.send(Message::Text(out.into())).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 }
@@ -2749,6 +3131,53 @@ async fn symbols(State(state): State<AppState>, Query(q): Query<AccountQuery>) -
     }
 }
 
+/// Bid/ask from MetaTrader on the **panel API host** (same machine as this backend), via `symbol_ticks` bridge.
+#[derive(Deserialize)]
+struct LocalSymbolTicksQuery {
+    #[serde(default)]
+    account_id: Option<String>,
+    /// Comma-separated symbol names (e.g. `EURUSDm,GBPUSDm`).
+    symbols: String,
+}
+
+async fn local_symbol_ticks(
+    State(state): State<AppState>,
+    Query(q): Query<LocalSymbolTicksQuery>,
+) -> impl IntoResponse {
+    let account_id = match resolve_account_id(&state, q.account_id.clone()) {
+        Ok(id) => id,
+        Err(e) => return (StatusCode::BAD_REQUEST, json_error(&e)),
+    };
+    let symbols: Vec<String> = q
+        .symbols
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .take(48)
+        .collect();
+    if symbols.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            json_error("symbols query param required (comma-separated, e.g. EURUSDm,GBPUSDm)"),
+        );
+    }
+    let path = match get_path_for_account(&state, &account_id) {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                json_error("no terminal path configured for this account_id"),
+            );
+        }
+    };
+    let body = serde_json::json!({ "symbols": symbols }).to_string();
+    const LOCAL_TICKS_TIMEOUT_MS: u64 = 3000;
+    match call_python_bridge_with_timeout("symbol_ticks", &body, &path, LOCAL_TICKS_TIMEOUT_MS) {
+        Ok(s) => (StatusCode::OK, axum::body::Body::from(s)),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, json_error(&e)),
+    }
+}
+
 async fn positions(State(state): State<AppState>, Query(q): Query<AccountQuery>) -> impl IntoResponse {
     let account_id = match resolve_account_id(&state, q.account_id) {
         Ok(id) => id,
@@ -2803,6 +3232,18 @@ struct RemotePositionsPeekBody {
 /// Same merged snapshot as `/ws/remote-positions` initial frame — for browsers (JWT or panel key via middleware).
 async fn agent_remote_positions_snapshot_get(State(state): State<AppState>) -> impl IntoResponse {
     let raw = state.remote_positions.snapshot_json(&state.agent);
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(v) => Json(v).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok": false, "error": "snapshot_serialize"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn agent_remote_history_snapshot_get(State(state): State<AppState>) -> impl IntoResponse {
+    let raw = state.remote_history.snapshot_json(&state.agent);
     match serde_json::from_str::<serde_json::Value>(&raw) {
         Ok(v) => Json(v).into_response(),
         Err(_) => (

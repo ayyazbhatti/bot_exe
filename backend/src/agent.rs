@@ -118,6 +118,15 @@ struct RemoteWorkerConfig {
     min_interval_minutes: f64,
     max_interval_minutes: f64,
     max_open_positions: u32,
+    /// Optional SL distance in pips for each worker-opened position (panel → agent → bridge).
+    #[serde(default)]
+    sl_pips: Option<f64>,
+    /// Optional TP distance in pips.
+    #[serde(default)]
+    tp_pips: Option<f64>,
+    /// If set, `fixed_lot_tick` skips opening when live spread (pips) on the agent exceeds this (checked on device MT5).
+    #[serde(default)]
+    max_spread_pips: Option<f64>,
     #[serde(default)]
     next_run_unix: i64,
     #[serde(default)]
@@ -135,6 +144,9 @@ impl Default for RemoteWorkerConfig {
             min_interval_minutes: 5.0,
             max_interval_minutes: 10.0,
             max_open_positions: 0,
+            sl_pips: None,
+            tp_pips: None,
+            max_spread_pips: None,
             next_run_unix: 0,
             last_direction: None,
         }
@@ -398,6 +410,31 @@ impl AgentStore {
         rows.into_iter().take(limit).collect()
     }
 
+    /// Remove `pending`, `done`, and `failed` commands. Keeps `in_flight` so agents can still POST complete.
+    /// `device_filter`: `None` or empty = all devices; otherwise only matching `device_id`.
+    pub fn clear_commands_queue(&mut self, device_filter: Option<&str>) -> Result<usize, String> {
+        let scope = device_filter.map(|s| s.trim()).filter(|s| !s.is_empty());
+        let before = self.file.commands.len();
+        self.file.commands.retain(|c| {
+            if c.status == "in_flight" {
+                return true;
+            }
+            match &scope {
+                None => false,
+                Some(did) => {
+                    if c.device_id != *did {
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }
+        });
+        let removed = before - self.file.commands.len();
+        self.save().map_err(|e| e.to_string())?;
+        Ok(removed)
+    }
+
     /// Same recency window as `list_devices` → `probably_online`.
     pub fn device_probably_online(last_heartbeat_unix: i64, now: i64) -> bool {
         const SEEN_RECENT_SECS: i64 = 180;
@@ -577,15 +614,20 @@ impl AgentStore {
                 "min_interval_minutes": w.min_interval_minutes,
                 "max_interval_minutes": w.max_interval_minutes,
                 "max_open_positions": w.max_open_positions,
+                "sl_pips": w.sl_pips,
+                "tp_pips": w.tp_pips,
+                "max_spread_pips": w.max_spread_pips,
                 "next_run_unix": w.next_run_unix,
                 "last_direction": w.last_direction,
             })
         })
     }
 
-    pub fn scheduler_tick(&mut self) -> usize {
+    /// Returns `(commands_queued, worker_config_changed)` — emit hub refresh when either is non-zero / true.
+    pub fn scheduler_tick(&mut self) -> (usize, bool) {
         let now = chrono::Utc::now().timestamp();
         let mut queued = 0usize;
+        let mut config_changed = false;
         let mut to_enqueue: Vec<(String, serde_json::Value)> = Vec::new();
         let device_ids: Vec<String> = self.file.worker_configs.keys().cloned().collect();
         for device_id in device_ids {
@@ -593,6 +635,15 @@ impl AgentStore {
                 continue;
             };
             if !cfg.enabled {
+                continue;
+            }
+            let sl_ok = cfg.sl_pips.map(|s| s.is_finite() && s > 0.0).unwrap_or(false);
+            let tp_ok = cfg.tp_pips.map(|t| t.is_finite() && t > 0.0).unwrap_or(false);
+            if !sl_ok || !tp_ok {
+                // Legacy or tampered configs: never open without both stops.
+                cfg.enabled = false;
+                cfg.next_run_unix = 0;
+                config_changed = true;
                 continue;
             }
             if cfg.next_run_unix > now {
@@ -618,14 +669,29 @@ impl AgentStore {
             };
             cfg.last_direction = Some(order_type.clone());
             let volume = Self::random_volume(cfg.min_volume, cfg.max_volume);
-            let payload = json!({
-                "account_ids": cfg.account_ids,
+            let mut payload = json!({
+                "account_ids": cfg.account_ids.clone(),
                 "symbol": symbol,
                 "order_type": order_type,
                 "volume": volume,
                 "comment": "remote-fixedlot",
                 "max_open_positions": cfg.max_open_positions
             });
+            if let Some(s) = cfg.sl_pips {
+                if s.is_finite() && s > 0.0 {
+                    payload["sl_pips"] = json!(s);
+                }
+            }
+            if let Some(t) = cfg.tp_pips {
+                if t.is_finite() && t > 0.0 {
+                    payload["tp_pips"] = json!(t);
+                }
+            }
+            if let Some(m) = cfg.max_spread_pips {
+                if m.is_finite() && m > 0.0 {
+                    payload["max_spread_pips"] = json!(m);
+                }
+            }
             to_enqueue.push((device_id.clone(), payload));
             cfg.next_run_unix = now + Self::next_worker_delay_sec(cfg);
             queued += 1;
@@ -633,10 +699,10 @@ impl AgentStore {
         for (device_id, payload) in to_enqueue {
             let _ = self.enqueue_command(&device_id, "fixed_lot_tick", payload, 120);
         }
-        if queued > 0 {
+        if queued > 0 || config_changed {
             let _ = self.save();
         }
-        queued
+        (queued, config_changed)
     }
 }
 
@@ -960,6 +1026,38 @@ pub async fn agent_list_commands(State(state): State<AppState>, Json(body): Json
 }
 
 #[derive(Deserialize)]
+pub struct ClearCommandsBody {
+    pub admin_key: String,
+    /// If set and non-empty, only commands for this device are removed (non–in-flight). If omitted or empty, all devices.
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+pub async fn agent_commands_clear(State(state): State<AppState>, Json(body): Json<ClearCommandsBody>) -> impl IntoResponse {
+    if !state.verify_agent_admin_key(Some(body.admin_key.as_str())) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"ok": false, "error": "unauthorized"}))).into_response();
+    }
+    let filter = body
+        .device_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let mut store = state.agent.lock().unwrap();
+    match store.clear_commands_queue(filter) {
+        Ok(removed) => {
+            drop(store);
+            state.emit_agent_hub_refresh();
+            Json(json!({"ok": true, "removed": removed})).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "error": e})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
 pub struct WorkerSetBody {
     pub admin_key: String,
     pub device_id: String,
@@ -974,6 +1072,12 @@ pub struct WorkerSetBody {
     pub max_interval_minutes: f64,
     #[serde(default)]
     pub max_open_positions: u32,
+    #[serde(default)]
+    pub sl_pips: Option<f64>,
+    #[serde(default)]
+    pub tp_pips: Option<f64>,
+    #[serde(default)]
+    pub max_spread_pips: Option<f64>,
 }
 
 pub async fn agent_worker_set(State(state): State<AppState>, Json(body): Json<WorkerSetBody>) -> impl IntoResponse {
@@ -981,6 +1085,16 @@ pub async fn agent_worker_set(State(state): State<AppState>, Json(body): Json<Wo
         return (StatusCode::UNAUTHORIZED, Json(json!({"ok": false, "error": "unauthorized"}))).into_response();
     }
     let mut store = state.agent.lock().unwrap();
+    let sl_pips = body.sl_pips.filter(|x| x.is_finite() && *x > 0.0);
+    let tp_pips = body.tp_pips.filter(|x| x.is_finite() && *x > 0.0);
+    let max_spread_pips = body.max_spread_pips.filter(|x| x.is_finite() && *x > 0.0);
+    if body.enabled && (sl_pips.is_none() || tp_pips.is_none()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "Remote worker requires both SL and TP (pips) when enabled."})),
+        )
+            .into_response();
+    }
     let cfg = RemoteWorkerConfig {
         enabled: body.enabled,
         account_ids: body.account_ids,
@@ -990,6 +1104,9 @@ pub async fn agent_worker_set(State(state): State<AppState>, Json(body): Json<Wo
         min_interval_minutes: body.min_interval_minutes,
         max_interval_minutes: body.max_interval_minutes,
         max_open_positions: body.max_open_positions,
+        sl_pips,
+        tp_pips,
+        max_spread_pips,
         ..RemoteWorkerConfig::default()
     };
     match store.set_worker_config(&body.device_id, cfg) {
@@ -1137,6 +1254,36 @@ async fn handle_agent_device_ws(mut socket: WebSocket, state: AppState, device_i
                             }
                         }
                     }
+                    "history_deals_snapshot" => {
+                        let Some(results) = v.get("results").cloned() else {
+                            let _ = socket
+                                .send(Message::Text(
+                                    json!({"ok": false, "error": "missing results"}).to_string().into(),
+                                ))
+                                .await;
+                            continue;
+                        };
+                        let merge = v.get("merge").and_then(|x| x.as_bool()) == Some(true);
+                        let apply_res = if merge {
+                            state.remote_history_merge_snapshot(&device_id, results)
+                        } else {
+                            state.remote_history_apply_snapshot(&device_id, results)
+                        };
+                        match apply_res {
+                            Ok(()) => {
+                                let _ = socket.send(Message::Text(r#"{"ok":true}"#.into())).await;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "mt5-panel-api: history_deals_snapshot rejected for device_id={}: {}",
+                                    device_id, e
+                                );
+                                let _ = socket
+                                    .send(Message::Text(json!({"ok": false, "error": e}).to_string().into()))
+                                    .await;
+                            }
+                        }
+                    }
                     _ => continue,
                 }
             }
@@ -1148,18 +1295,20 @@ async fn handle_agent_device_ws(mut socket: WebSocket, state: AppState, device_i
             _ => {}
         }
     }
-    state.remote_positions_clear_device(&device_id);
+    // Keep last known remote snapshots on transient WS disconnects (tunnel/network blips).
+    // Heartbeat still reports online status separately; caches are replaced on next snapshot.
+    // This avoids empty Live Positions / History panes during short reconnect windows.
 }
 
 pub async fn remote_worker_scheduler_loop(state: AppState) {
     use tokio::time::{sleep, Duration};
     loop {
         sleep(Duration::from_secs(2)).await;
-        let n = {
+        let (queued, cfg_changed) = {
             let mut store = state.agent.lock().unwrap();
             store.scheduler_tick()
         };
-        if n > 0 {
+        if queued > 0 || cfg_changed {
             state.emit_agent_hub_refresh();
         }
     }
