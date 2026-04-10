@@ -43,7 +43,9 @@ CONFIG_NAME = "config.json"
 _PATH_LOCKS_GUARD = threading.Lock()
 _path_bridge_locks: dict[str, threading.Lock] = {}
 
-DEFAULT_POSITIONS_SNAPSHOT_INTERVAL_SEC = 10.0
+DEFAULT_POSITIONS_SNAPSHOT_INTERVAL_SEC = 2.0
+DEFAULT_HISTORY_DEALS_SNAPSHOT_INTERVAL_SEC = 30.0
+MAX_PARALLEL_POSITIONS_BRIDGE = 16
 MAX_BATCH_MARKET_ORDERS = 256
 
 
@@ -77,6 +79,14 @@ def _cfg_nonneg_float(cfg: dict[str, Any], key: str, default: float, *, lo: floa
         return max(lo, min(hi, v))
     except (TypeError, ValueError):
         return default
+
+
+def _cfg_history_deals_days(cfg: dict[str, Any]) -> int:
+    try:
+        d = int(cfg.get("history_deals_days", 30))
+        return max(1, min(365, d))
+    except (TypeError, ValueError):
+        return 30
 
 
 def agent_dir() -> Path:
@@ -259,6 +269,24 @@ def _configured_terminal_count(cfg: dict[str, Any]) -> int:
     return n
 
 
+def _configured_account_ids(cfg: dict[str, Any]) -> list[str]:
+    """Account ids with a terminal path (deduped), for local “close all” and similar."""
+    accounts = cfg.get("accounts") or {}
+    if not isinstance(accounts, dict):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for aid_raw, term_path in accounts.items():
+        aid = _account_id_str(aid_raw)
+        if not aid or not str(term_path).strip():
+            continue
+        if aid in seen:
+            continue
+        seen.add(aid)
+        out.append(aid)
+    return out
+
+
 def _snapshot_summary(results: list[dict[str, Any]]) -> tuple[int, int, int]:
     """(account rows, total open positions, rows with bridge_error)."""
     n_acc = len(results)
@@ -343,6 +371,71 @@ def _sanitize_position_dicts(positions: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _flatten_live_tab_rows(
+    results: list[dict[str, Any]],
+) -> tuple[list[tuple[str, tuple[Any, ...], tuple[str, ...]]], float, int]:
+    """Build ordered (iid, values, tags) rows for the Live positions Treeview."""
+    rows: list[tuple[str, tuple[Any, ...], tuple[str, ...]]] = []
+    total_pnl = 0.0
+    n_open = 0
+    for row in results:
+        aid = str(row.get("account_id") or "")
+        lab = str(row.get("label") or "")
+        berr = row.get("bridge_error")
+        if berr:
+            vals = (
+                aid,
+                lab,
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                str(berr)[:300],
+            )
+            rows.append((f"{aid}:err", vals, ("err",)))
+            continue
+        for pos in row.get("positions") or []:
+            if not isinstance(pos, dict):
+                continue
+            try:
+                tix = int(pos.get("ticket") or 0)
+            except (TypeError, ValueError):
+                tix = 0
+            total_pnl += _finite_float(pos.get("profit"))
+            n_open += 1
+            vals = (
+                aid,
+                lab,
+                str(pos.get("symbol") or ""),
+                str(pos.get("type") or ""),
+                f"{pos.get('volume', '')!s}",
+                f"{pos.get('price_open', '')!s}",
+                f"{pos.get('sl', '')!s}",
+                f"{pos.get('tp', '')!s}",
+                f"{pos.get('profit', '')!s}",
+                str(tix),
+                "",
+            )
+            rows.append((f"{aid}:{tix}", vals, ()))
+
+    def _sort_key(t: tuple[str, tuple[Any, ...], tuple[str, ...]]) -> tuple[str, int]:
+        iid = t[0]
+        if iid.endswith(":err"):
+            return (iid, 0)
+        try:
+            _a, ts = iid.rsplit(":", 1)
+            return (_a, int(ts))
+        except ValueError:
+            return (iid, 0)
+
+    rows.sort(key=_sort_key)
+    return rows, total_pnl, n_open
+
+
 def _row_from_positions_bridge(aid: str, label: str, p: dict[str, Any]) -> dict[str, Any]:
     positions: list[dict[str, Any]] = []
     bridge_error: str | None = None
@@ -355,6 +448,142 @@ def _row_from_positions_bridge(aid: str, label: str, p: dict[str, Any]) -> dict[
     if bridge_error:
         row["bridge_error"] = bridge_error
     return row
+
+
+def _sanitize_deal_dicts(deals: Any) -> list[dict[str, Any]]:
+    """JSON-safe deal rows from history_deals bridge (matches mt5_bridge history_deals output)."""
+    if not isinstance(deals, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for raw in deals:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            tid = raw.get("ticket")
+            pid = raw.get("position_id")
+            ent = raw.get("entry")
+            out.append(
+                {
+                    "ticket": int(tid) if tid is not None else 0,
+                    "time": int(raw.get("time") or 0),
+                    "symbol": str(raw.get("symbol") or ""),
+                    "type": str(raw.get("type") or ""),
+                    "volume": _finite_float(raw.get("volume")),
+                    "price": _finite_float(raw.get("price")),
+                    "profit": _finite_float(raw.get("profit")),
+                    "swap": _finite_float(raw.get("swap")),
+                    "commission": _finite_float(raw.get("commission")),
+                    "entry": int(ent) if ent is not None and str(ent).strip() != "" else None,
+                    "position_id": int(pid) if pid is not None else 0,
+                    "comment": str(raw.get("comment") or "")[:200],
+                }
+            )
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _deal_entry_label(entry: Any) -> str:
+    try:
+        e = int(entry)
+    except (TypeError, ValueError):
+        return ""
+    return {0: "in", 1: "out", 2: "inout", 3: "out_by"}.get(e, str(e))
+
+
+def _format_deal_time(ts: int) -> str:
+    if ts <= 0:
+        return ""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    except (OSError, ValueError, OverflowError):
+        return str(ts)
+
+
+def _row_from_history_bridge(aid: str, label: str, p: dict[str, Any]) -> dict[str, Any]:
+    deals: list[dict[str, Any]] = []
+    bridge_error: str | None = None
+    if p.get("ok") and isinstance(p.get("deals"), list):
+        deals = _sanitize_deal_dicts(p["deals"])
+    else:
+        msg = (p.get("message") or p.get("error") or p.get("hint") or "").strip() or (
+            "bridge or MT5 did not return history deals"
+        )
+        bridge_error = msg[:512]
+    row: dict[str, Any] = {"account_id": aid, "label": label, "deals": deals}
+    if bridge_error:
+        row["bridge_error"] = bridge_error
+    return row
+
+
+def _flatten_history_tab_rows(
+    results: list[dict[str, Any]],
+) -> tuple[list[tuple[str, tuple[Any, ...], tuple[str, ...]]], float, int]:
+    """Build ordered (iid, values, tags) rows for the Position history Treeview."""
+    keyed: list[tuple[tuple[Any, ...], str, tuple[Any, ...], tuple[str, ...]]] = []
+    total_net = 0.0
+    n_deals = 0
+    for row in results:
+        aid = str(row.get("account_id") or "")
+        lab = str(row.get("label") or "")
+        berr = row.get("bridge_error")
+        if berr:
+            vals = (
+                aid,
+                lab,
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                str(berr)[:300],
+            )
+            keyed.append(((-1, str(aid)), f"{aid}:histerr", vals, ("err",)))
+            continue
+        for d in row.get("deals") or []:
+            if not isinstance(d, dict):
+                continue
+            try:
+                tix = int(d.get("ticket") or 0)
+            except (TypeError, ValueError):
+                tix = 0
+            tm = int(d.get("time") or 0)
+            pr = _finite_float(d.get("profit"))
+            sw = _finite_float(d.get("swap"))
+            cm = _finite_float(d.get("commission"))
+            net = pr + sw + cm
+            total_net += net
+            n_deals += 1
+            pos_id = int(d.get("position_id") or 0)
+            keyed.append(
+                (
+                    (0, -tm, -tix, str(aid)),
+                    f"{aid}:{tix}",
+                    (
+                        aid,
+                        lab,
+                        _format_deal_time(tm),
+                        str(d.get("symbol") or ""),
+                        str(d.get("type") or ""),
+                        _deal_entry_label(d.get("entry")),
+                        f"{d.get('volume', '')!s}",
+                        f"{d.get('price', '')!s}",
+                        f"{net:,.2f}",
+                        str(tix),
+                        str(pos_id) if pos_id else "",
+                        str(d.get("comment") or "")[:120],
+                    ),
+                    (),
+                )
+            )
+
+    keyed.sort(key=lambda x: x[0])
+    rows = [(t[1], t[2], t[3]) for t in keyed]
+    return rows, total_net, n_deals
 
 
 def positions_snapshot_path_groups(config_path: Path) -> list[tuple[str, list[tuple[str, str]]]]:
@@ -465,12 +694,36 @@ def scan_folder_for_terminals(root: Path, max_depth: int = 6) -> list[tuple[str,
     return found
 
 
+def _positions_ui_queue_put(q: queue.Queue | None, accumulated: list[dict[str, Any]]) -> None:
+    """Copy final snapshot for local GUI (Tk) after a full positions merge (no partial UI updates)."""
+    if q is None:
+        return
+    try:
+        payload = json.loads(json.dumps({"results": accumulated}, default=str))
+        q.put_nowait(payload)
+    except Exception:
+        pass
+
+
+def _history_ui_queue_put(q: queue.Queue | None, accumulated: list[dict[str, Any]]) -> None:
+    """Copy history_deals snapshot for local Position history tab (no panel WebSocket)."""
+    if q is None:
+        return
+    try:
+        payload = json.loads(json.dumps({"results": accumulated}, default=str))
+        q.put_nowait(payload)
+    except Exception:
+        pass
+
+
 def device_inventory_ws_loop(
     config_path: Path,
     stop: threading.Event,
     push_queue: queue.Queue,
     trace: dict[str, Any] | None = None,
     trace_lock: threading.Lock | None = None,
+    positions_ui_queue: queue.Queue | None = None,
+    history_ui_queue: queue.Queue | None = None,
 ) -> None:
     """Push config `accounts` to panel over WebSocket; `push_queue` triggers re-send after folder scan."""
     if websocket is None:
@@ -561,6 +814,7 @@ def device_inventory_ws_loop(
                     last_panel_ack="(no inventory ack in 5s — tunnel slow or panel error)",
                 )
             last_positions_sent = 0.0
+            last_history_sent = 0.0
             while not stop.is_set():
                 now = time.monotonic()
                 drained = False
@@ -596,13 +850,14 @@ def device_inventory_ws_loop(
                             last_snapshot_phase='No MT5 paths in config — click “Set MT5 clones folder…” or edit accounts.',
                             last_snapshot_pending_terminals=0,
                         )
+                        _positions_ui_queue_put(positions_ui_queue, [])
                     else:
                         _trace_set(
                             trace,
                             trace_lock,
                             last_snapshot_phase=(
-                                f"Querying {n_cfg} MT5 path(s) — streaming partial updates to panel, "
-                                f"then full refresh (~60s max per bridge call)…"
+                                f"Querying {n_cfg} MT5 path(s) — bridges run in parallel; streaming merges to panel "
+                                f"and Live tab (~60s max per path, wall time ~slowest path)…"
                             ),
                             last_snapshot_pending_terminals=n_cfg,
                         )
@@ -610,32 +865,49 @@ def device_inventory_ws_loop(
                         path_groups = positions_snapshot_path_groups(config_path)
                         accumulated: list[dict[str, Any]] = []
                         n_paths = len(path_groups)
-                        for pi, (path_s, acc_list) in enumerate(path_groups):
-                            _trace_set(
-                                trace,
-                                trace_lock,
-                                last_snapshot_phase=(
-                                    f"MT5 path {pi + 1}/{n_paths} (Live Positions update after each path)…"
-                                ),
-                            )
-                            p = bridge_call(cfg_snap, "positions", {}, path_s)
-                            chunk = [_row_from_positions_bridge(aid, label, p) for aid, label in acc_list]
-                            accumulated.extend(chunk)
-                            if chunk:
-                                ws.send(
-                                    json.dumps(
-                                        {"type": "positions_snapshot", "merge": True, "results": chunk},
-                                        default=str,
-                                        ensure_ascii=False,
-                                        allow_nan=False,
+                        n_workers = min(MAX_PARALLEL_POSITIONS_BRIDGE, max(1, n_paths))
+                        future_by_pi: list[Any] = []
+                        if n_paths:
+                            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                                future_by_pi = [
+                                    pool.submit(bridge_call, cfg_snap, "positions", {}, path_s)
+                                    for path_s, _al in path_groups
+                                ]
+                                for pi, ((path_s, acc_list), fut) in enumerate(
+                                    zip(path_groups, future_by_pi)
+                                ):
+                                    _trace_set(
+                                        trace,
+                                        trace_lock,
+                                        last_snapshot_phase=(
+                                            f"MT5 path {pi + 1}/{n_paths} (merge to WebSocket + UI)…"
+                                        ),
                                     )
-                                )
-                                _drain_snapshot_ws_ack(
-                                    ws,
-                                    trace,
-                                    trace_lock,
-                                    ok_note="ok (incremental positions merge)",
-                                )
+                                    p = fut.result()
+                                    chunk = [
+                                        _row_from_positions_bridge(aid, label, p)
+                                        for aid, label in acc_list
+                                    ]
+                                    accumulated.extend(chunk)
+                                    if chunk:
+                                        ws.send(
+                                            json.dumps(
+                                                {
+                                                    "type": "positions_snapshot",
+                                                    "merge": True,
+                                                    "results": chunk,
+                                                },
+                                                default=str,
+                                                ensure_ascii=False,
+                                                allow_nan=False,
+                                            )
+                                        )
+                                        _drain_snapshot_ws_ack(
+                                            ws,
+                                            trace,
+                                            trace_lock,
+                                            ok_note="ok (incremental positions merge)",
+                                        )
                         payload_final = json.dumps(
                             {"type": "positions_snapshot", "results": accumulated},
                             default=str,
@@ -665,6 +937,7 @@ def device_inventory_ws_loop(
                             last_snapshot_phase="",
                             last_snapshot_pending_terminals=0,
                         )
+                        _positions_ui_queue_put(positions_ui_queue, accumulated)
                     except (ValueError, TypeError) as ex:
                         print("[inventory-ws] positions_snapshot json encode:", ex, flush=True)
                         _trace_set(
@@ -685,6 +958,61 @@ def device_inventory_ws_loop(
                             last_snapshot_phase="",
                             last_snapshot_pending_terminals=0,
                         )
+                hist_every = _cfg_nonneg_float(
+                    cfg_snap,
+                    "history_deals_snapshot_interval_sec",
+                    DEFAULT_HISTORY_DEALS_SNAPSHOT_INTERVAL_SEC,
+                    lo=10.0,
+                    hi=600.0,
+                )
+                if now - last_history_sent >= hist_every:
+                    n_hist = _configured_terminal_count(cfg_snap)
+                    accumulated_h: list[dict[str, Any]] = []
+                    history_ok = True
+                    if n_hist == 0:
+                        _history_ui_queue_put(history_ui_queue, [])
+                    else:
+                        try:
+                            path_groups_h = positions_snapshot_path_groups(config_path)
+                            n_paths_h = len(path_groups_h)
+                            n_workers_h = min(MAX_PARALLEL_POSITIONS_BRIDGE, max(1, n_paths_h))
+                            days_body = {"days": _cfg_history_deals_days(cfg_snap)}
+                            if n_paths_h:
+                                with ThreadPoolExecutor(max_workers=n_workers_h) as pool:
+                                    futures_h = [
+                                        pool.submit(
+                                            bridge_call, cfg_snap, "history_deals", days_body, path_s
+                                        )
+                                        for path_s, _al in path_groups_h
+                                    ]
+                                    for (_path_s, acc_list), fut_h in zip(path_groups_h, futures_h):
+                                        p_h = fut_h.result()
+                                        for aid_h, label_h in acc_list:
+                                            accumulated_h.append(
+                                                _row_from_history_bridge(aid_h, label_h, p_h)
+                                            )
+                            _history_ui_queue_put(history_ui_queue, accumulated_h)
+                        except Exception as ex:
+                            history_ok = False
+                            print("[inventory-ws] history_deals snapshot failed:", ex, flush=True)
+                    if history_ok:
+                        try:
+                            hist_payload = json.dumps(
+                                {"type": "history_deals_snapshot", "results": accumulated_h},
+                                default=str,
+                                ensure_ascii=False,
+                                allow_nan=False,
+                            )
+                            ws.send(hist_payload)
+                            _drain_snapshot_ws_ack(
+                                ws,
+                                trace,
+                                trace_lock,
+                                ok_note="ok (panel stored history deals)",
+                            )
+                        except Exception as ex:
+                            print("[inventory-ws] history_deals_snapshot to panel failed:", ex, flush=True)
+                    last_history_sent = time.monotonic()
                 raw_in = None
                 try:
                     ws.settimeout(1.0)
@@ -769,6 +1097,40 @@ def mt5_quick_check(cfg: dict[str, Any]) -> bool:
     return False
 
 
+def _parse_optional_positive_pips(val: Any) -> float | None:
+    if val is None:
+        return None
+    try:
+        x = float(val)
+        return x if x > 0 and math.isfinite(x) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def estimate_spread_pips(symbol: str, bid: float, ask: float) -> float:
+    """Match panel `estimateSpreadPips` (majors / JPY / metals / crypto)."""
+    sp = float(ask) - float(bid)
+    if not (sp > 0) or not math.isfinite(sp):
+        return 0.0
+    u = symbol.upper()
+    if "JPY" in u:
+        return sp / 0.01
+    if "XAU" in u or "XAG" in u:
+        return sp / 0.01
+    if "BTC" in u or "ETH" in u:
+        return sp
+    return sp / 0.0001
+
+
+def _merge_sl_tp_pips_into_body(body: dict[str, Any], src: dict[str, Any]) -> None:
+    sl = _parse_optional_positive_pips(src.get("sl_pips"))
+    tp = _parse_optional_positive_pips(src.get("tp_pips"))
+    if sl is not None:
+        body["sl_pips"] = sl
+    if tp is not None:
+        body["tp_pips"] = tp
+
+
 def run_create_position(cfg: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     account_id = (payload.get("account_id") or "default").strip()
     accounts: dict[str, str] = cfg.get("accounts") or {}
@@ -781,6 +1143,7 @@ def run_create_position(cfg: dict[str, Any], payload: dict[str, Any]) -> dict[st
         "volume": float(payload.get("volume") or 0.01),
         "comment": (payload.get("comment") or "remote-agent").strip(),
     }
+    _merge_sl_tp_pips_into_body(body, payload)
     return bridge_call(cfg, "create_position", body, term_path)
 
 
@@ -802,6 +1165,8 @@ def run_place_market_orders_batch(cfg: dict[str, Any], payload: dict[str, Any]) 
     except (TypeError, ValueError):
         default_vol = 0.01
     default_comment = str(payload.get("comment") or "panel-remote").strip()
+    payload_sl = _parse_optional_positive_pips(payload.get("sl_pips"))
+    payload_tp = _parse_optional_positive_pips(payload.get("tp_pips"))
 
     grouped: dict[str, list[tuple[str, dict[str, Any], str]]] = defaultdict(list)
     errors: list[dict[str, Any]] = []
@@ -825,6 +1190,16 @@ def run_place_market_orders_batch(cfg: dict[str, Any], payload: dict[str, Any]) 
             vol = default_vol
         com = str(item.get("comment") if item.get("comment") is not None else default_comment).strip()
         body = {"symbol": sym, "order_type": ot, "volume": vol, "comment": com}
+        i_sl = _parse_optional_positive_pips(item.get("sl_pips"))
+        i_tp = _parse_optional_positive_pips(item.get("tp_pips"))
+        if i_sl is not None:
+            body["sl_pips"] = i_sl
+        elif payload_sl is not None:
+            body["sl_pips"] = payload_sl
+        if i_tp is not None:
+            body["tp_pips"] = i_tp
+        elif payload_tp is not None:
+            body["tp_pips"] = payload_tp
         nk = _normalized_terminal_path_key(tp_s) or tp_s
         grouped[nk].append((aid, body, tp_s))
 
@@ -875,6 +1250,7 @@ def run_fixed_lot_tick(cfg: dict[str, Any], payload: dict[str, Any]) -> dict[str
     volume = float(payload.get("volume") or 0.01)
     comment = str(payload.get("comment") or "remote-fixedlot")
     max_open_positions = int(payload.get("max_open_positions") or 0)
+    max_spread_pips = _parse_optional_positive_pips(payload.get("max_spread_pips"))
 
     idx_line: dict[int, str] = {}
     path_to_triples: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
@@ -898,6 +1274,41 @@ def run_fixed_lot_tick(cfg: dict[str, Any], payload: dict[str, Any]) -> dict[str
 
     def work_path(norm_key: str) -> None:
         nonlocal any_ok
+        triples = path_to_triples[norm_key]
+        if max_spread_pips is not None and symbol and triples:
+            _i0, _a0, tp0 = triples[0]
+            tick_out = bridge_call(cfg, "symbol_ticks", {"symbols": [symbol]}, tp0)
+            if not tick_out.get("ok"):
+                msg = tick_out.get("message") or tick_out.get("error") or "symbol_ticks failed"
+                for i, aid, _tp in triples:
+                    idx_line[i] = f"{aid}: skipped (spread check: {msg})"
+                return
+            ticks = tick_out.get("ticks") if isinstance(tick_out.get("ticks"), dict) else {}
+            row = ticks.get(symbol)
+            if row is None:
+                su = str(symbol).upper()
+                for k, v in ticks.items():
+                    if str(k).upper() == su and isinstance(v, dict):
+                        row = v
+                        break
+            if not isinstance(row, dict):
+                for i, aid, _tp in triples:
+                    idx_line[i] = f"{aid}: skipped (no tick for spread check)"
+                return
+            try:
+                bid = float(row.get("bid") or 0.0)
+                ask = float(row.get("ask") or 0.0)
+            except (TypeError, ValueError):
+                bid = 0.0
+                ask = 0.0
+            sp_pips = estimate_spread_pips(symbol, bid, ask)
+            if sp_pips > float(max_spread_pips):
+                for i, aid, _tp in triples:
+                    idx_line[i] = (
+                        f"{aid}: skipped (spread {sp_pips:.2f} pips > max {float(max_spread_pips):.2f})"
+                    )
+                return
+
         for i, aid, tp in path_to_triples[norm_key]:
             if max_open_positions > 0:
                 p = bridge_call(cfg, "positions", {}, tp)
@@ -907,17 +1318,14 @@ def run_fixed_lot_tick(cfg: dict[str, Any], payload: dict[str, Any]) -> dict[str
                         with state_lock:
                             idx_line[i] = f"{aid}: skipped (max open {max_open_positions})"
                         continue
-            out = bridge_call(
-                cfg,
-                "create_position",
-                {
-                    "symbol": symbol,
-                    "order_type": order_type,
-                    "volume": volume,
-                    "comment": comment,
-                },
-                tp,
-            )
+            body_cp: dict[str, Any] = {
+                "symbol": symbol,
+                "order_type": order_type,
+                "volume": volume,
+                "comment": comment,
+            }
+            _merge_sl_tp_pips_into_body(body_cp, payload)
+            out = bridge_call(cfg, "create_position", body_cp, tp)
             if out.get("ok"):
                 line = f"{aid}: ok"
                 with state_lock:
@@ -1123,9 +1531,13 @@ def run_windows_pairing_ui(path: Path) -> None:
     auth_lost = threading.Event()
     paired = False
     inventory_push_queue: queue.Queue = queue.Queue()
+    positions_ui_queue: queue.Queue = queue.Queue()
+    history_ui_queue: queue.Queue = queue.Queue()
     inventory_trace: dict[str, Any] = {}
     inventory_trace_lock = threading.Lock()
     running_widgets: List[Any] = []
+    positions_ui_after: list[Any] = [None]
+    history_ui_after: list[Any] = [None]
 
     root = tk.Tk()
     root.title("MT5 Remote Agent — pair this PC")
@@ -1199,7 +1611,15 @@ def run_windows_pairing_ui(path: Path) -> None:
         threading.Thread(target=poll_loop, args=(path, stop, auth_lost), daemon=True).start()
         threading.Thread(
             target=device_inventory_ws_loop,
-            args=(path, stop, inventory_push_queue, inventory_trace, inventory_trace_lock),
+            args=(
+                path,
+                stop,
+                inventory_push_queue,
+                inventory_trace,
+                inventory_trace_lock,
+                positions_ui_queue,
+                history_ui_queue,
+            ),
             daemon=True,
         ).start()
         status_var.set("Status: Connected — online with panel (fields locked).")
@@ -1214,11 +1634,25 @@ def run_windows_pairing_ui(path: Path) -> None:
         label_entry.configure(state="disabled")
         reg_btn.configure(state="disabled", text="Registered")
         err_var.set("")
-        cfg_path_lbl = ttk.Label(main, text=f"Config: {path}", font=("Consolas", 8), foreground="#64748b")
+        hint.pack_forget()
+        root.resizable(True, True)
+        root.minsize(680, 480)
+
+        nb = ttk.Notebook(main)
+        nb.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        running_widgets.append(nb)
+        tab_agent = ttk.Frame(nb, padding=(0, 8))
+        tab_pos = ttk.Frame(nb, padding=(4, 8))
+        tab_hist = ttk.Frame(nb, padding=(4, 8))
+        nb.add(tab_agent, text="Agent")
+        nb.add(tab_pos, text="Live positions")
+        nb.add(tab_hist, text="Position history")
+
+        cfg_path_lbl = ttk.Label(tab_agent, text=f"Config: {path}", font=("Consolas", 8), foreground="#64748b")
         cfg_path_lbl.pack(anchor=tk.W, pady=(10, 0))
         running_widgets.append(cfg_path_lbl)
         lbl_keep = ttk.Label(
-            main,
+            tab_agent,
             text="Keep this window open or minimized — closing stops the agent.",
             wraplength=420,
             font=("Segoe UI", 9),
@@ -1229,7 +1663,7 @@ def run_windows_pairing_ui(path: Path) -> None:
 
         diag_var = tk.StringVar(value="Live link: starting…")
         diag_lbl = ttk.Label(
-            main,
+            tab_agent,
             textvariable=diag_var,
             font=("Consolas", 9),
             foreground="#334155",
@@ -1331,7 +1765,7 @@ def run_windows_pairing_ui(path: Path) -> None:
             status_var.set("Terminal paths cleared — syncing empty list to panel…")
             inventory_push_queue.put(1)
 
-        mt5_row = ttk.Frame(main)
+        mt5_row = ttk.Frame(tab_agent)
         mt5_row.pack(fill=tk.X, pady=(10, 0))
         running_widgets.append(mt5_row)
         ttk.Button(
@@ -1352,18 +1786,339 @@ def run_windows_pairing_ui(path: Path) -> None:
             wraplength=420,
         ).pack(side=tk.LEFT, padx=(10, 0))
 
+        close_row = ttk.Frame(tab_agent)
+        close_row.pack(fill=tk.X, pady=(10, 0))
+        running_widgets.append(close_row)
+
+        def on_close_all_positions() -> None:
+            from tkinter import messagebox
+
+            c0 = load_config(path)
+            aids0 = _configured_account_ids(c0)
+            if not aids0:
+                messagebox.showinfo(
+                    "Close all positions",
+                    "No MT5 terminals are configured. Use “Set MT5 clones folder…” first, or edit config.json.",
+                    parent=root,
+                )
+                return
+            if not messagebox.askyesno(
+                "Close all positions",
+                "Close every open position on all MT5 terminals configured on this PC?\n\n"
+                "This sends the same close requests as the panel (market close per ticket). "
+                "It cannot be undone.",
+                icon="warning",
+                parent=root,
+            ):
+                return
+
+            close_all_btn.configure(state="disabled")
+
+            def worker() -> None:
+                try:
+                    c2 = load_config(path)
+                    aids2 = _configured_account_ids(c2)
+                    if not aids2:
+                        res: dict[str, Any] = {
+                            "ok": False,
+                            "message": "No terminals configured",
+                            "closed_count": 0,
+                            "failed_count": 0,
+                        }
+                    else:
+                        res = run_close_positions_selected(c2, {"account_ids": aids2})
+                except Exception as ex:
+                    res = {"ok": False, "message": str(ex), "closed_count": 0, "failed_count": 0}
+
+                def finish() -> None:
+                    try:
+                        close_all_btn.configure(state="normal")
+                    except tk.TclError:
+                        pass
+                    msg = str(res.get("message") or "Done")
+                    cc = int(res.get("closed_count") or 0)
+                    fc = int(res.get("failed_count") or 0)
+                    title = "Close all positions"
+                    if res.get("ok") and fc == 0:
+                        messagebox.showinfo(title, f"Closed: {cc}\n\n{msg}", parent=root)
+                    elif res.get("ok"):
+                        messagebox.showwarning(title, f"Closed: {cc}  Failed: {fc}\n\n{msg}", parent=root)
+                    else:
+                        messagebox.showerror(title, f"Closed: {cc}  Failed: {fc}\n\n{msg}", parent=root)
+
+                root.after(0, finish)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        close_all_btn = ttk.Button(
+            close_row,
+            text="Close all open positions…",
+            command=on_close_all_positions,
+        )
+        close_all_btn.pack(side=tk.LEFT)
+        ttk.Label(
+            close_row,
+            text="All configured terminals on this PC (parallel closes per MT5 instance).",
+            foreground="#64748b",
+            wraplength=420,
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+        hint_agent = ttk.Label(
+            tab_agent,
+            text='After connecting: Set / Add folder for MT5 paths, or Reset paths to clear the panel list.',
+            wraplength=420,
+            font=("Segoe UI", 9),
+        )
+        hint_agent.pack(anchor=tk.W, pady=(12, 0))
+        running_widgets.append(hint_agent)
+
+        cols = (
+            "account",
+            "label",
+            "symbol",
+            "type",
+            "volume",
+            "open",
+            "sl",
+            "tp",
+            "profit",
+            "ticket",
+            "note",
+        )
+        pos_tree = ttk.Treeview(tab_pos, columns=cols, show="headings", height=14, selectmode=tk.BROWSE)
+        _h = (
+            "Account",
+            "Label",
+            "Symbol",
+            "Type",
+            "Volume",
+            "Open",
+            "SL",
+            "TP",
+            "Profit",
+            "Ticket",
+            "Note",
+        )
+        _w = (88, 160, 72, 52, 56, 78, 56, 56, 72, 72, 200)
+        for c, h, w in zip(cols, _h, _w):
+            pos_tree.heading(c, text=h)
+            pos_tree.column(c, width=w, minwidth=36, stretch=(c in ("label", "note")))
+        pos_tree.tag_configure("err", foreground="#b00020")
+        pos_total_pnl_var = tk.StringVar(value="Total open P/L: —")
+        pnl_summary_lbl = tk.Label(
+            tab_pos,
+            textvariable=pos_total_pnl_var,
+            font=("Segoe UI", 12, "bold"),
+            foreground="#64748b",
+            anchor="w",
+        )
+        pnl_summary_lbl.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        running_widgets.append(pnl_summary_lbl)
+        vsb = ttk.Scrollbar(tab_pos, orient=tk.VERTICAL, command=pos_tree.yview)
+        hsb = ttk.Scrollbar(tab_pos, orient=tk.HORIZONTAL, command=pos_tree.xview)
+        pos_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        pos_tree.grid(row=1, column=0, sticky="nsew")
+        vsb.grid(row=1, column=1, sticky="ns")
+        hsb.grid(row=2, column=0, sticky="ew")
+        tab_pos.grid_rowconfigure(1, weight=1)
+        tab_pos.grid_columnconfigure(0, weight=1)
+        running_widgets.extend([pos_tree, vsb, hsb])
+        pos_help = ttk.Label(
+            tab_pos,
+            text=(
+                "The panel still receives incremental WebSocket merges; this table refreshes once per snapshot when "
+                "all paths are merged (stable row order — no shuffling). MT5 is re-read on "
+                "positions_snapshot_interval_sec (default 2s); bridges run in parallel (~slowest path)."
+            ),
+            wraplength=640,
+            font=("Segoe UI", 9),
+            foreground="#64748b",
+            justify=tk.LEFT,
+        )
+        pos_help.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        running_widgets.append(pos_help)
+
+        hcols = (
+            "account",
+            "label",
+            "time",
+            "symbol",
+            "type",
+            "entry",
+            "volume",
+            "price",
+            "net",
+            "deal",
+            "position",
+            "note",
+        )
+        hist_tree = ttk.Treeview(tab_hist, columns=hcols, show="headings", height=14, selectmode=tk.BROWSE)
+        _hh = (
+            "Account",
+            "Label",
+            "Time",
+            "Symbol",
+            "Type",
+            "Entry",
+            "Volume",
+            "Price",
+            "Net P/L",
+            "Deal",
+            "Position",
+            "Note",
+        )
+        _hw = (72, 140, 128, 68, 44, 44, 52, 72, 72, 56, 64, 180)
+        for c, h, w in zip(hcols, _hh, _hw):
+            hist_tree.heading(c, text=h)
+            hist_tree.column(c, width=w, minwidth=36, stretch=(c in ("label", "note")))
+        hist_tree.tag_configure("err", foreground="#b00020")
+        hist_summary_var = tk.StringVar(value="History (closed deals): —")
+        hist_summary_lbl = tk.Label(
+            tab_hist,
+            textvariable=hist_summary_var,
+            font=("Segoe UI", 12, "bold"),
+            foreground="#64748b",
+            anchor="w",
+        )
+        hist_summary_lbl.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        running_widgets.append(hist_summary_lbl)
+        hvsb = ttk.Scrollbar(tab_hist, orient=tk.VERTICAL, command=hist_tree.yview)
+        hhsb = ttk.Scrollbar(tab_hist, orient=tk.HORIZONTAL, command=hist_tree.xview)
+        hist_tree.configure(yscrollcommand=hvsb.set, xscrollcommand=hhsb.set)
+        hist_tree.grid(row=1, column=0, sticky="nsew")
+        hvsb.grid(row=1, column=1, sticky="ns")
+        hhsb.grid(row=2, column=0, sticky="ew")
+        tab_hist.grid_rowconfigure(1, weight=1)
+        tab_hist.grid_columnconfigure(0, weight=1)
+        running_widgets.extend([hist_tree, hvsb, hhsb])
+        hist_help = ttk.Label(
+            tab_hist,
+            text=(
+                "Closed buy/sell deals from MT5 (profit+swap+commission as Net P/L). "
+                "Refreshes on history_deals_snapshot_interval_sec (default 30s); window = history_deals_days in config "
+                "(default 30, max 500 deals per terminal). Not sent to the panel."
+            ),
+            wraplength=640,
+            font=("Segoe UI", 9),
+            foreground="#64748b",
+            justify=tk.LEFT,
+        )
+        hist_help.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        running_widgets.append(hist_help)
+
+        def apply_positions_rows_to_tree(results: list[dict[str, Any]]) -> None:
+            rows_flat, total_pnl, n_open = _flatten_live_tab_rows(results)
+            id_to_row = {r[0]: (r[1], r[2]) for r in rows_flat}
+            want = set(id_to_row.keys())
+            for iid in list(pos_tree.get_children()):
+                if iid not in want:
+                    pos_tree.delete(iid)
+            for iid in list(pos_tree.get_children()):
+                vals, tags = id_to_row[iid]
+                pos_tree.item(iid, values=vals, tags=tags)
+            existing_after = set(pos_tree.get_children())
+            for iid, vals, tags in rows_flat:
+                if iid in existing_after:
+                    continue
+                pos_tree.insert("", tk.END, iid=iid, values=vals, tags=tags)
+            if n_open == 0:
+                pos_total_pnl_var.set("Total open P/L: 0.00  ·  0 positions")
+                pnl_summary_lbl.configure(foreground="#64748b")
+            else:
+                pos_total_pnl_var.set(
+                    f"Total open P/L: {total_pnl:+,.2f}  ·  {n_open} position{'s' if n_open != 1 else ''}"
+                )
+                pnl_summary_lbl.configure(foreground="#15803d" if total_pnl >= 0 else "#b00020")
+
+        def drain_positions_ui_queue() -> None:
+            if not paired:
+                positions_ui_after[0] = None
+                return
+            latest: dict[str, Any] | None = None
+            while True:
+                try:
+                    latest = positions_ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+            if latest is not None:
+                apply_positions_rows_to_tree(latest.get("results") or [])
+            positions_ui_after[0] = root.after(20, drain_positions_ui_queue)
+
+        positions_ui_after[0] = root.after(80, drain_positions_ui_queue)
+
+        def apply_history_rows_to_tree(results: list[dict[str, Any]]) -> None:
+            rows_flat, total_net, n_deals = _flatten_history_tab_rows(results)
+            id_to_row = {r[0]: (r[1], r[2]) for r in rows_flat}
+            want = set(id_to_row.keys())
+            for iid in list(hist_tree.get_children()):
+                if iid not in want:
+                    hist_tree.delete(iid)
+            for iid in list(hist_tree.get_children()):
+                vals, tags = id_to_row[iid]
+                hist_tree.item(iid, values=vals, tags=tags)
+            existing_after = set(hist_tree.get_children())
+            for iid, vals, tags in rows_flat:
+                if iid in existing_after:
+                    continue
+                hist_tree.insert("", tk.END, iid=iid, values=vals, tags=tags)
+            if n_deals == 0:
+                hist_summary_var.set("History (closed deals): 0 deals in window  ·  Net P/L: 0.00")
+                hist_summary_lbl.configure(foreground="#64748b")
+            else:
+                hist_summary_var.set(
+                    f"History (closed deals): {n_deals} deal{'s' if n_deals != 1 else ''}  ·  "
+                    f"Net P/L (sum): {total_net:+,.2f}"
+                )
+                hist_summary_lbl.configure(foreground="#15803d" if total_net >= 0 else "#b00020")
+
+        def drain_history_ui_queue() -> None:
+            if not paired:
+                history_ui_after[0] = None
+                return
+            latest_h: dict[str, Any] | None = None
+            while True:
+                try:
+                    latest_h = history_ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+            if latest_h is not None:
+                apply_history_rows_to_tree(latest_h.get("results") or [])
+            history_ui_after[0] = root.after(20, drain_history_ui_queue)
+
+        history_ui_after[0] = root.after(80, drain_history_ui_queue)
+
     def return_to_pairing_mode() -> None:
         """Panel returned 401 — clear credentials and show URL + code fields again."""
         nonlocal stop, paired, cfg
         stop.set()
         stop = threading.Event()
         paired = False
+        aid = positions_ui_after[0]
+        if aid is not None:
+            try:
+                root.after_cancel(aid)
+            except tk.TclError:
+                pass
+            positions_ui_after[0] = None
+        hid = history_ui_after[0]
+        if hid is not None:
+            try:
+                root.after_cancel(hid)
+            except tk.TclError:
+                pass
+            history_ui_after[0] = None
         for w in running_widgets:
             try:
                 w.destroy()
             except tk.TclError:
                 pass
         running_widgets.clear()
+        try:
+            hint.pack(anchor=tk.W, pady=(12, 0))
+        except tk.TclError:
+            pass
+        root.resizable(True, False)
+        root.minsize(460, 440)
         c = load_config(path)
         c["device_id"] = ""
         c["token"] = ""
