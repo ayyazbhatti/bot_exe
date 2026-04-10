@@ -7,6 +7,7 @@ import BotLivePositions from './pages/BotLivePositions'
 import FixedLot from './pages/FixedLot'
 import ExnessClones from './pages/ExnessClones'
 import RemoteAgents from './pages/RemoteAgents'
+import RemoteHistory from './pages/RemoteHistory'
 
 const API = '/api'
 const WORKER_STORAGE_KEY = 'mt5bot_worker'
@@ -74,7 +75,14 @@ function loadSlTpPips(): Record<string, SlTpPips> {
   return defaultSlTpPips()
 }
 
-type Page = 'livepositions' | 'trading' | 'fixedlot' | 'exnessclones' | 'remoteagents' | 'login'
+type Page =
+  | 'livepositions'
+  | 'positionhistory'
+  | 'trading'
+  | 'fixedlot'
+  | 'exnessclones'
+  | 'remoteagents'
+  | 'login'
 
 export type WorkerPlaceMode = 'both' | 'master_slave_hedge'
 
@@ -151,6 +159,7 @@ async function patchWorkerConfig(patch: Record<string, unknown>): Promise<Worker
 
 const HASH_TO_PAGE: Record<string, Page> = {
   livepositions: 'livepositions',
+  positionhistory: 'positionhistory',
   trading: 'trading',
   /** Legacy route: same screen as fixed lot */
   settings: 'fixedlot',
@@ -165,7 +174,8 @@ const HASH_TO_PAGE: Record<string, Page> = {
   positions: 'trading',
   closedpairs: 'trading',
   closeboth: 'trading',
-  history: 'trading',
+  /** Deal history from remote agents (#history kept as alias) */
+  history: 'positionhistory',
 }
 
 function getPageFromHash(): Page {
@@ -218,7 +228,11 @@ export default function App() {
   }, [refreshSession])
 
   useEffect(() => {
-    if (session.user?.role === 'viewer' && currentPage !== 'livepositions') {
+    if (
+      session.user?.role === 'viewer' &&
+      currentPage !== 'livepositions' &&
+      currentPage !== 'positionhistory'
+    ) {
       window.location.hash = '#livepositions'
     }
   }, [session.user, currentPage])
@@ -244,7 +258,6 @@ export default function App() {
       '#positions': '#trading',
       '#closedpairs': '#trading',
       '#closeboth': '#trading',
-      '#history': '#trading',
       '#terminallogin': '#trading',
     }
     const to = legacy[h]
@@ -664,6 +677,7 @@ export default function App() {
 
   const pageTitles: Record<Page, string> = {
     livepositions: 'Live Positions',
+    positionhistory: 'Remote deal history',
     trading: 'Bot Trading',
     fixedlot: 'Single account (random lot)',
     exnessclones: 'Exness terminal clones',
@@ -706,6 +720,12 @@ export default function App() {
         <div className="sidebar-brand">MT5 Bot</div>
         <nav className="sidebar-nav" style={{ flex: 1 }}>
           {nav('livepositions', 'Live Positions')}
+          <a
+            href="#history"
+            className={currentPage === 'positionhistory' ? 'active' : ''}
+          >
+            Position history
+          </a>
           {!viewer && nav('trading', 'Bot Trading')}
           {!viewer && nav('fixedlot', 'Single account (random lot)')}
           {!viewer && nav('exnessclones', 'Exness terminal clones')}
@@ -746,6 +766,8 @@ export default function App() {
           <RemoteAgents />
         ) : currentPage === 'livepositions' ? (
           <BotLivePositions />
+        ) : currentPage === 'positionhistory' ? (
+          <RemoteHistory />
         ) : loading ? (
           <div className="card">
             <p className="loading">Connecting to MT5…</p>
